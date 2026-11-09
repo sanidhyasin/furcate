@@ -1,5 +1,5 @@
-# Local trace store for development. The credentials are for this local container
-# only and match store.DefaultDSN.
+# Local stores for development: ClickHouse for spans, Postgres for run state. The
+# credentials are for these local containers only and match the default DSNs.
 services:
   clickhouse:
     image: clickhouse/clickhouse-server:25.8
@@ -23,5 +23,22 @@ services:
       timeout: 2s
       retries: 30
 
+  postgres:
+    image: postgres:17.6
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: furcate
+      POSTGRES_USER: furcate
+      POSTGRES_PASSWORD: furcate
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "furcate", "-d", "furcate"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
 volumes:
   clickhouse-data:
+  postgres-data:

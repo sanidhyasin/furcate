@@ -396,3 +396,23 @@ func (c *CH) Count(ctx context.Context) (uint64, error) {
 	err := c.conn.QueryRow(ctx, `SELECT count() FROM spans`).Scan(&n)
 	return n, err
 }
+
+// LLMRequest returns the request body recorded on one LLM span of a run, for the
+// replay engine. A run's ID is its trace ID.
+func (c *CH) LLMRequest(ctx context.Context, runID, spanID string) ([]byte, error) {
+	spans, err := c.Trace(ctx, runID, true)
+	if err != nil {
+		return nil, err
+	}
+	for _, s := range spans {
+		if s.SpanID != spanID {
+			continue
+		}
+		hash, ok := s.Payloads["furcate.llm.request"]
+		if !ok {
+			return nil, fmt.Errorf("span %s has no recorded request", spanID)
+		}
+		return c.Payload(ctx, hash)
+	}
+	return nil, fmt.Errorf("span %s not in trace %s yet", spanID, runID)
+}

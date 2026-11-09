@@ -36,6 +36,11 @@ Usage:
   furcate loadgen [flags]          send synthetic agent runs to a collector
   furcate bench [flags]            time trace loads and stats queries
 
+  furcate run -task t.json         run an agent, checkpointing every step
+  furcate steps <run-id>           a run's steps and their checkpoints
+  furcate fork -step k <run-id>    run N continuations from step k, with a change
+  furcate branches <run-id>        pass rates of a run's branches
+
 Run "furcate <command> -h" for a command's flags.
 `
 
@@ -66,6 +71,14 @@ func main() {
 		err = runLoadgen(ctx, args)
 	case "bench":
 		err = runBench(ctx, args)
+	case "run":
+		err = runRun(ctx, args)
+	case "steps":
+		err = runSteps(ctx, args)
+	case "fork":
+		err = runFork(ctx, args)
+	case "branches":
+		err = runBranches(ctx, args)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:

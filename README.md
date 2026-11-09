@@ -11,14 +11,17 @@ Design doc: <https://claude.ai/artifact/QsPmNLTXC9aALQR5ZT1hTK>
 
 ## Status
 
-**Phase 1 of 5: the trace store.** Furcate is LLM observability for now. Forking
-arrives in Phase 2 with the sandbox driver interface and the
-[tine](../tine) driver.
+**Phase 2 of 5: checkpoints and fork.** The core is built and tested: the driver
+interface, the run controller that checkpoints every step, run state in Postgres,
+the replay engine and `furcate fork`. What's missing is a real sandbox driver. The
+tine driver needs three operations tine doesn't have yet: starting VMs from a
+saved snapshot, snapshots that outlive their VM, and VMs with no network. Until
+then, forking is exercised only through a test-only directory driver.
 
 | Phase | What | State |
 | --- | --- | --- |
 | 1 | Trace store: collector, ClickHouse, payloads, CLI, load generator | built; numbers below are from a laptop |
-| 2 | Driver interface, tine driver, checkpoints, `furcate fork` | not started |
+| 2 | Driver interface, tine driver, checkpoints, `furcate fork` | core built and tested; tine driver waits on tine |
 | 3 | Bisect and branch compare, Docker driver | not started |
 | 4 | Evals from checkpoints, GitHub Action | not started |
 | 5 | Drop-in mode, web UI, more drivers | not started |
@@ -26,7 +29,7 @@ arrives in Phase 2 with the sandbox driver interface and the
 ## Quick start
 
 ```bash
-docker compose up -d --wait        # ClickHouse 25.8 on :9000
+docker compose up -d --wait        # ClickHouse 25.8 on :9000, Postgres 17 on :5432
 go build -o bin/furcate ./cmd/furcate
 ./bin/furcate collector            # OTLP on :4318 (HTTP) and :4317 (gRPC)
 ```
@@ -39,6 +42,16 @@ In another terminal:
 ./bin/furcate trace <trace-id>     # one run as a tree; -payloads shows prompts
 ./bin/furcate stats                # LLM calls by model: latency, tokens, cost
 ./bin/furcate bench                # trace-load and query timings, storage per span
+```
+
+Forking (needs a sandbox driver, so not yet runnable outside tests):
+
+```bash
+./bin/furcate run -task task.json                 # run an agent; checkpoint before every LLM call
+./bin/furcate steps <run-id>                      # steps, spans and checkpoints
+./bin/furcate fork -step 5 -n 10 \
+    -append-system "Never delete test fixtures." <run-id>
+./bin/furcate branches <run-id>                   # pass rate per (step, change), with 95% CIs
 ```
 
 Any OpenTelemetry SDK can send to `http://localhost:4318/v1/traces`. Spans that
@@ -102,7 +115,38 @@ What the numbers say so far:
   flushed records: about 10,000 duplicate rows in the test above. Trace reads
   collapse duplicates by `span_id`; rollups overcount until that's fixed.
 
+## How a fork works
+
+1. The **run controller** (`internal/controller`) runs the agent loop on the host.
+   Only tools (`bash`, `write_file`) execute in the sandbox. Before every LLM call
+   it asks the driver for a checkpoint. Each call's full request body goes on its
+   span, and each step gets a row in Postgres.
+2. `furcate fork -step k` looks up step k's checkpoint and span, then reads the
+   recorded request back from ClickHouse.
+3. The driver restores the checkpoint into N sandboxes, offline if it can. The
+   change is applied to the request, and N continuations run in parallel. Each
+   continuation is a new run and a new trace, linked to its parent and step.
+4. The task's check (a command, exit 0 = pass) scores each branch. The result is a
+   pass rate with a Wilson 95% interval, not one anecdote.
+
+A change only appends or touches the newest message. A prompt patch becomes a
+mid-conversation `system` message rather than an edit to the system prompt; a
+tool-output override replaces only the last tool result. The history the model
+already reasoned over stays byte-identical. That keeps the prompt cache warm and
+passes the API's check that replayed thinking blocks belong to an unedited
+conversation.
+
 ## Decisions taken while building
+
+- **The conversation is kept as raw JSON, never re-encoded.** The first version
+  decoded the recorded request into the SDK's typed params for each branch. A test
+  caught that this reorders the keys inside earlier `tool_use` inputs, so a branch
+  would send different bytes than the model saw. Messages are now encoded once
+  when appended, and a branch resends the recorded body as is.
+- **A branch reuses its parent's checkpoint for its first step** instead of taking
+  a new one of an identical state.
+- **Refusal fallbacks are on by default** (`-no-fallbacks` to turn off). The span
+  records which model actually answered.
 
 - **Payloads in a ClickHouse table**, not one file each. The first version wrote a
   zstd file per payload. Profiling showed 87% of collector CPU in file-system
@@ -125,12 +169,22 @@ internal/blob        payload hashing and the stored-hash cache
 internal/tracetree   rebuilds and renders a trace tree
 internal/loadgen     synthetic agent runs
 internal/pricing     tokens to dollars
+internal/driver      the sandbox driver interface; testdir is a test-only driver
+internal/controller  the agent loop: checkpoints, spans and steps for every run
+internal/replay      fork: restore step k, apply a change, run N continuations
+internal/runstore    run, step and checkpoint state (Postgres; in-memory for tests)
+internal/agent       the raw-JSON conversation, the Claude client, sandbox tools
+internal/task        task specs: template, prompt, model, success check
+internal/stats       Wilson intervals
 ```
 
 ## Development
 
 ```bash
 go test -race ./...
+# against the compose stores, with `furcate collector` running:
+FURCATE_TEST_PG='postgres://furcate:furcate@localhost:5432/furcate?sslmode=disable' \
+FURCATE_TEST_E2E=1 go test -race ./...
 ```
 
 `/debug/stats` on the collector shows live counters; `/debug/pprof` profiles it.
