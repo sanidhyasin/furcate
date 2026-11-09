@@ -1,0 +1,27 @@
+# Local trace store for development. The credentials are for this local container
+# only and match store.DefaultDSN.
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    ports:
+      - "9000:9000" # native protocol (the collector and CLI)
+      - "8123:8123" # HTTP, for clickhouse-client or curl
+    environment:
+      CLICKHOUSE_DB: furcate
+      CLICKHOUSE_USER: furcate
+      CLICKHOUSE_PASSWORD: furcate
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "furcate", "--password", "furcate", "--query", "SELECT 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  clickhouse-data:
