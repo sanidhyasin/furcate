@@ -17,6 +17,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go/v2"
@@ -26,6 +28,7 @@ import (
 
 	"github.com/sanidhyasin/furcate/internal/agent"
 	"github.com/sanidhyasin/furcate/internal/driver"
+	"github.com/sanidhyasin/furcate/internal/pricing"
 	"github.com/sanidhyasin/furcate/internal/runstore"
 	"github.com/sanidhyasin/furcate/internal/task"
 )
@@ -45,6 +48,7 @@ const (
 	AttrLLMRequest   = "furcate.llm.request"
 	AttrLLMResponse  = "furcate.llm.response"
 	AttrDriver       = "furcate.driver"
+	AttrCostUSD      = "furcate.cost_usd"
 )
 
 // MaxTokens per model call. Requests are not streamed, so this stays at a size
@@ -59,16 +63,30 @@ type Controller struct {
 	Store  runstore.Store
 	Tracer trace.Tracer
 	Log    *slog.Logger
-	Keep   bool // leave instances running after a run, for inspection
+	Keep   bool          // leave instances running after a run, for inspection
+	Prices pricing.Table // nil: pricing.Defaults()
+	// Slots, if set, bounds how many sandboxes this process runs at once. A run
+	// takes one slot for its sandbox; forks take one per branch.
+	Slots *Slots
 }
 
 // Result is one finished run.
 type Result struct {
-	RunID   string
-	Status  string // runstore.StatusDone or StatusError
-	Outcome string // pass, fail, or "" on error
-	Steps   int    // last step index
-	Err     error
+	RunID    string
+	Status   string // runstore.StatusDone or StatusError
+	Outcome  string // pass, fail, or "" on error
+	Steps    int    // last step index
+	Usage    runstore.Usage
+	Duration time.Duration
+	Err      error
+}
+
+// runState is one run in progress.
+type runState struct {
+	id    string
+	start time.Time
+	usage runstore.Usage
+	files map[string]string
 }
 
 // Branch says where a continuation came from.
@@ -77,6 +95,7 @@ type Branch struct {
 	ParentStep   int
 	Change       json.RawMessage
 	CheckpointID string // the parent's checkpoint for ParentStep, reused as this run's first
+	Eval         runstore.EvalTag
 }
 
 // InitialParams is the first request of a task's run.
@@ -104,19 +123,24 @@ func (c *Controller) Start(ctx context.Context, t *task.Task) Result {
 		attribute.String(AttrTaskID, t.ID),
 		attribute.String(AttrDriver, c.Driver.Caps().Name),
 	))
-	runID := root.SpanContext().TraceID().String()
-	root.SetAttributes(attribute.String(AttrRunID, runID))
+	rs := &runState{id: root.SpanContext().TraceID().String(), start: time.Now()}
+	root.SetAttributes(attribute.String(AttrRunID, rs.id))
 
 	if err := c.Store.CreateRun(ctx, runstore.Run{
-		RunID: runID, TaskID: t.ID, Task: t.JSON(), Driver: c.Driver.Caps().Name,
+		RunID: rs.id, TaskID: t.ID, Task: t.JSON(), Driver: c.Driver.Caps().Name,
 	}); err != nil {
 		root.End()
-		return Result{RunID: runID, Status: runstore.StatusError, Err: fmt.Errorf("record run: %w", err)}
+		return Result{RunID: rs.id, Status: runstore.StatusError, Err: fmt.Errorf("record run: %w", err)}
 	}
 
+	release, err := c.Slots.Acquire(ctx, 1)
+	if err != nil {
+		return c.finish(ctx, root, rs, 0, "", err)
+	}
+	defer release(1)
 	inst, err := c.Driver.Create(ctx, t.Template)
 	if err != nil {
-		return c.finish(ctx, root, runID, 0, "", fmt.Errorf("create sandbox: %w", err))
+		return c.finish(ctx, root, rs, 0, "", fmt.Errorf("create sandbox: %w", err))
 	}
 	defer c.destroy(inst)
 
@@ -126,14 +150,14 @@ func (c *Controller) Start(ctx context.Context, t *task.Task) Result {
 			err = fmt.Errorf("exit %d: %s%s", res.ExitCode, res.Stdout, res.Stderr)
 		}
 		if err != nil {
-			return c.finish(ctx, root, runID, 0, "", fmt.Errorf("setup %q: %w", cmd, err))
+			return c.finish(ctx, root, rs, 0, "", fmt.Errorf("setup %q: %w", cmd, err))
 		}
 	}
 	conv, err := agent.NewConversation(InitialParams(t))
 	if err != nil {
-		return c.finish(ctx, root, runID, 0, "", err)
+		return c.finish(ctx, root, rs, 0, "", err)
 	}
-	return c.drive(ctx, root, runID, t, inst, conv, 1, "")
+	return c.drive(ctx, root, rs, t, inst, conv, 1, "")
 }
 
 // Continue runs a branch on an instance already restored from the parent's
@@ -149,53 +173,55 @@ func (c *Controller) Continue(ctx context.Context, t *task.Task, inst driver.Ins
 		attribute.String(AttrParentRunID, br.ParentRunID),
 		attribute.Int(AttrParentStep, br.ParentStep),
 		attribute.String(AttrChange, string(br.Change)),
+		attribute.String("furcate.eval.case", br.Eval.Case),
+		attribute.String("furcate.eval.variant", br.Eval.Variant),
 	))
-	runID := root.SpanContext().TraceID().String()
-	root.SetAttributes(attribute.String(AttrRunID, runID))
+	rs := &runState{id: root.SpanContext().TraceID().String(), start: time.Now()}
+	root.SetAttributes(attribute.String(AttrRunID, rs.id))
 	defer c.destroy(inst)
 
 	if err := c.Store.CreateRun(ctx, runstore.Run{
-		RunID: runID, TaskID: t.ID, Task: t.JSON(), Driver: c.Driver.Caps().Name,
-		ParentRunID: br.ParentRunID, ParentStep: br.ParentStep, Change: br.Change,
+		RunID: rs.id, TaskID: t.ID, Task: t.JSON(), Driver: c.Driver.Caps().Name,
+		ParentRunID: br.ParentRunID, ParentStep: br.ParentStep, Change: br.Change, Eval: br.Eval,
 	}); err != nil {
 		root.End()
-		return Result{RunID: runID, Status: runstore.StatusError, Err: fmt.Errorf("record run: %w", err)}
+		return Result{RunID: rs.id, Status: runstore.StatusError, Err: fmt.Errorf("record run: %w", err)}
 	}
-	return c.drive(ctx, root, runID, t, inst, conv, br.ParentStep, br.CheckpointID)
+	return c.drive(ctx, root, rs, t, inst, conv, br.ParentStep, br.CheckpointID)
 }
 
 // drive is the agent loop. firstCP, if set, is an existing checkpoint of the
 // instance's current state, used for the first LLM step instead of a new one.
-func (c *Controller) drive(ctx context.Context, root trace.Span, runID string, t *task.Task,
+func (c *Controller) drive(ctx context.Context, root trace.Span, rs *runState, t *task.Task,
 	inst driver.Instance, conv *agent.Conversation, step int, firstCP string) Result {
 
 	llmCalls := 0
 	for {
 		if llmCalls >= t.MaxSteps {
-			c.Log.Info("max steps reached", "run", runID, "steps", llmCalls)
+			c.Log.Info("max steps reached", "run", rs.id, "steps", llmCalls)
 			break
 		}
 		cpID, cpDur := firstCP, time.Duration(0)
 		if cpID == "" {
 			var err error
-			if cpID, cpDur, err = c.checkpoint(ctx, runID, step, inst); err != nil {
-				return c.finish(ctx, root, runID, step, "", err)
+			if cpID, cpDur, err = c.checkpoint(ctx, rs.id, step, inst); err != nil {
+				return c.finish(ctx, root, rs, step, "", err)
 			}
 		}
 		firstCP = ""
 
-		msg, err := c.callModel(ctx, runID, step, cpID, cpDur, conv)
+		msg, err := c.callModel(ctx, rs, step, cpID, cpDur, conv)
 		if err != nil {
-			return c.finish(ctx, root, runID, step, "", err)
+			return c.finish(ctx, root, rs, step, "", err)
 		}
 		llmCalls++
 		step++
 		if err := conv.Append(msg.ToParam()); err != nil {
-			return c.finish(ctx, root, runID, step, "", err)
+			return c.finish(ctx, root, rs, step, "", err)
 		}
 		if msg.StopReason != anthropic.StopReasonToolUse {
 			if msg.StopReason == anthropic.StopReasonRefusal {
-				c.Log.Warn("model refused", "run", runID, "category", msg.StopDetails.Category)
+				c.Log.Warn("model refused", "run", rs.id, "category", msg.StopDetails.Category)
 			}
 			break
 		}
@@ -206,27 +232,28 @@ func (c *Controller) drive(ctx context.Context, root trace.Span, runID string, t
 			if !ok {
 				continue
 			}
-			res, err := c.runTool(ctx, runID, step, t, inst, agent.ToolCall{ID: tu.ID, Name: tu.Name, Input: json.RawMessage(tu.JSON.Input.Raw())})
+			res, err := c.runTool(ctx, rs.id, step, t, inst, agent.ToolCall{ID: tu.ID, Name: tu.Name, Input: json.RawMessage(tu.JSON.Input.Raw())})
 			if err != nil {
-				return c.finish(ctx, root, runID, step, "", err)
+				return c.finish(ctx, root, rs, step, "", err)
 			}
 			results = append(results, anthropic.NewToolResultBlock(tu.ID, res.Output, res.IsError))
 			step++
 		}
 		if err := conv.Append(anthropic.NewUserMessage(results...)); err != nil {
-			return c.finish(ctx, root, runID, step, "", err)
+			return c.finish(ctx, root, rs, step, "", err)
 		}
 	}
 
+	rs.files = c.manifest(ctx, inst, t.Workdir)
 	res, err := c.Driver.Exec(ctx, inst, driver.ExecRequest{Args: t.Check, Dir: t.Workdir, Timeout: 10 * time.Minute})
 	if err != nil {
-		return c.finish(ctx, root, runID, step-1, "", fmt.Errorf("check: %w", err))
+		return c.finish(ctx, root, rs, step-1, "", fmt.Errorf("check: %w", err))
 	}
 	outcome := runstore.OutcomeFail
 	if res.ExitCode == 0 {
 		outcome = runstore.OutcomePass
 	}
-	return c.finish(ctx, root, runID, step-1, outcome, nil)
+	return c.finish(ctx, root, rs, step-1, outcome, nil)
 }
 
 func (c *Controller) checkpoint(ctx context.Context, runID string, step int, inst driver.Instance) (string, time.Duration, error) {
@@ -249,8 +276,9 @@ func (c *Controller) checkpoint(ctx context.Context, runID string, step int, ins
 	return cp.CheckpointID, took, nil
 }
 
-func (c *Controller) callModel(ctx context.Context, runID string, step int, cpID string, cpDur time.Duration,
+func (c *Controller) callModel(ctx context.Context, rs *runState, step int, cpID string, cpDur time.Duration,
 	conv *agent.Conversation) (*anthropic.Message, error) {
+	runID := rs.id
 
 	req, err := conv.Body()
 	if err != nil {
@@ -277,7 +305,18 @@ func (c *Controller) callModel(ctx context.Context, runID string, step int, cpID
 		span.SetStatus(codes.Error, err.Error())
 		return nil, fmt.Errorf("model call at step %d: %w", step, err)
 	}
+	u := msg.Usage
+	prices := c.Prices
+	if prices == nil {
+		prices = pricing.Defaults()
+	}
+	cost := prices.CostWithCache(string(msg.Model), uint64(u.InputTokens), uint64(u.OutputTokens),
+		uint64(u.CacheReadInputTokens), uint64(u.CacheCreationInputTokens))
+	rs.usage = rs.usage.Add(runstore.Usage{LLMCalls: 1, InputTokens: u.InputTokens, OutputTokens: u.OutputTokens,
+		CacheReadTokens: u.CacheReadInputTokens, CacheWriteTokens: u.CacheCreationInputTokens, CostUSD: cost})
 	span.SetAttributes(
+		attribute.Float64(AttrCostUSD, cost),
+		attribute.Int64("gen_ai.usage.cache_creation.input_tokens", u.CacheCreationInputTokens),
 		attribute.String("gen_ai.response.model", string(msg.Model)),
 		attribute.String("gen_ai.response.id", msg.ID),
 		attribute.StringSlice("gen_ai.response.finish_reasons", []string{string(msg.StopReason)}),
@@ -331,7 +370,7 @@ func (c *Controller) runTool(ctx context.Context, runID string, step int, t *tas
 }
 
 // finish records the end of a run on its root span and in the store.
-func (c *Controller) finish(ctx context.Context, root trace.Span, runID string, lastStep int, outcome string, runErr error) Result {
+func (c *Controller) finish(ctx context.Context, root trace.Span, rs *runState, lastStep int, outcome string, runErr error) Result {
 	status := runstore.StatusDone
 	errMsg := ""
 	if runErr != nil {
@@ -347,10 +386,49 @@ func (c *Controller) finish(ctx context.Context, root trace.Span, runID string, 
 		}
 	}
 	root.End()
-	if err := c.Store.FinishRun(context.WithoutCancel(ctx), runID, status, outcome, errMsg); err != nil {
+	if err := c.Store.FinishRun(context.WithoutCancel(ctx), rs.id, runstore.End{
+		Status: status, Outcome: outcome, Error: errMsg, Usage: rs.usage, FinalFiles: rs.files,
+	}); err != nil {
 		runErr = errors.Join(runErr, fmt.Errorf("record finish: %w", err))
 	}
-	return Result{RunID: runID, Status: status, Outcome: outcome, Steps: lastStep, Err: runErr}
+	return Result{RunID: rs.id, Status: status, Outcome: outcome, Steps: lastStep, Usage: rs.usage,
+		Duration: time.Since(rs.start), Err: runErr}
+}
+
+// MaxManifestFiles bounds the final-files manifest.
+const MaxManifestFiles = 5000
+
+// manifest hashes every file under the workdir (skipping .git) when the run
+// ends, so two branches' final states can be compared. Best effort: a sandbox
+// without sha256sum just yields no manifest.
+func (c *Controller) manifest(ctx context.Context, inst driver.Instance, workdir string) map[string]string {
+	res, err := c.Driver.Exec(ctx, inst, driver.ExecRequest{
+		Args: []string{"sh", "-c", `h=sha256sum; command -v sha256sum >/dev/null || h="shasum -a 256"; ` +
+			`find . -type f -not -path './.git/*' -not -path '*/__pycache__/*' -exec $h {} + 2>/dev/null | head -n ` +
+			fmt.Sprint(MaxManifestFiles)},
+		Dir: workdir, Timeout: time.Minute,
+	})
+	if err != nil || res.ExitCode != 0 {
+		return nil
+	}
+	files := map[string]string{}
+	for _, line := range strings.Split(string(res.Stdout), "\n") {
+		hash, path, ok := strings.Cut(line, "  ")
+		if ok && len(hash) == 64 {
+			files[path] = hash
+		}
+	}
+	return files
+}
+
+// SortedPaths lists a manifest's paths in order.
+func SortedPaths(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for p := range m {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (c *Controller) destroy(inst driver.Instance) {

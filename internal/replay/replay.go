@@ -29,9 +29,9 @@ type Conversations interface {
 }
 
 // Change is what a branch does differently from its parent at step k. Every
-// change is append-only or touches only the newest message, so the history the
-// model already reasoned over stays byte-identical and its earlier thinking
-// blocks remain valid.
+// change but System is append-only or touches only the newest message, so the
+// history the model already reasoned over stays byte-identical and its earlier
+// thinking blocks remain valid.
 type Change struct {
 	// Model replaces the model for the rest of the branch. Thinking blocks from
 	// another model are dropped by the API, unbilled.
@@ -42,10 +42,17 @@ type Change struct {
 	AppendSystem string `json:"append_system,omitempty"`
 	// ToolOutput replaces the output of the last tool call before step k.
 	ToolOutput *string `json:"tool_output,omitempty"`
+	// System replaces the top-level system prompt, as a PR that edits an agent's
+	// prompt does. Unlike the other changes this edits history, so the branch
+	// drops the earlier thinking blocks (the API would reject them) and starts
+	// with a cold prompt cache.
+	System *string `json:"system,omitempty"`
 }
 
 // IsZero reports a plain rerun from step k.
-func (c Change) IsZero() bool { return c.Model == "" && c.AppendSystem == "" && c.ToolOutput == nil }
+func (c Change) IsZero() bool {
+	return c.Model == "" && c.AppendSystem == "" && c.ToolOutput == nil && c.System == nil
+}
 
 func (c Change) String() string {
 	var parts []string
@@ -58,6 +65,13 @@ func (c Change) String() string {
 	if c.ToolOutput != nil {
 		parts = append(parts, fmt.Sprintf("tool_output=%q", *c.ToolOutput))
 	}
+	if c.System != nil {
+		s := *c.System
+		if len(s) > 40 {
+			s = s[:40] + "..."
+		}
+		parts = append(parts, fmt.Sprintf("system=%q", s))
+	}
 	if len(parts) == 0 {
 		return "none"
 	}
@@ -67,6 +81,12 @@ func (c Change) String() string {
 // Apply edits the request for step k. Only the newest message is touched or
 // added; the history before it keeps its bytes.
 func (c Change) Apply(conv *agent.Conversation) error {
+	if c.System != nil {
+		conv.SetSystem(*c.System)
+		if err := conv.StripThinking(); err != nil {
+			return err
+		}
+	}
 	if c.ToolOutput != nil {
 		if err := conv.ReplaceLastToolResult(*c.ToolOutput); err != nil {
 			return err
@@ -110,6 +130,7 @@ type Result struct {
 	Passes   int
 	Done     int // branches that finished without error
 	Lo, Hi   float64
+	Usage    runstore.Usage // all branches together
 }
 
 // Fork runs N continuations of RunID from Step and waits for all of them.
@@ -150,31 +171,73 @@ func (e *Engine) Fork(ctx context.Context, req Request) (*Result, error) {
 		return nil, err
 	}
 	changeJSON, _ := json.Marshal(req.Change)
-
-	sb := e.Controller.Driver
-	insts, err := sb.Fork(ctx, driver.CheckpointID(cp.DriverRef), req.N, sb.Caps().OfflineForks)
+	res, err := e.Run(ctx, Spec{
+		Task: t, Checkpoint: driver.CheckpointID(cp.DriverRef), Conversation: conv, N: req.N,
+		Branch: controller.Branch{ParentRunID: req.RunID, ParentStep: req.Step, Change: changeJSON, CheckpointID: step.CheckpointID},
+	})
 	if err != nil {
-		for _, inst := range insts {
-			sb.Destroy(context.WithoutCancel(ctx), inst)
-		}
-		return nil, fmt.Errorf("fork checkpoint: %w", err)
+		return nil, err
 	}
+	res.Request = req
+	return res, nil
+}
 
-	res := &Result{Request: req, Branches: make([]controller.Result, len(insts))}
+// Spec is one fork without the run store's history: what evals use when a case
+// comes from a bundle rather than from a recorded run.
+type Spec struct {
+	Task         *task.Task
+	Checkpoint   driver.CheckpointID // the driver's ref
+	Conversation *agent.Conversation // the request for the first step, change applied
+	N            int
+	Branch       controller.Branch // parent, step, change, eval tags; copied to every branch
+}
+
+// Run forks spec.Checkpoint into N sandboxes and runs the continuations,
+// admitting branches as sandbox slots free up, a chunk at a time, each chunk
+// forked in one driver call.
+func (e *Engine) Run(ctx context.Context, spec Spec) (*Result, error) {
+	sb := e.Controller.Driver
+	offline := sb.Caps().OfflineForks
+	res := &Result{Branches: make([]controller.Result, spec.N)}
 	var wg sync.WaitGroup
-	for i, inst := range insts {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// Each branch gets its own copy: branches append to their history.
-			res.Branches[i] = e.Controller.Continue(ctx, t, inst, conv.Clone(), controller.Branch{
-				ParentRunID: req.RunID, ParentStep: req.Step, Change: changeJSON, CheckpointID: step.CheckpointID,
-			})
-		}()
+	for next := 0; next < spec.N; {
+		k, release, err := e.Controller.Slots.AcquireUpTo(ctx, spec.N-next)
+		if err != nil {
+			wg.Wait()
+			return nil, err
+		}
+		insts, err := sb.Fork(ctx, spec.Checkpoint, k, offline)
+		if err != nil {
+			for _, inst := range insts {
+				sb.Destroy(context.WithoutCancel(ctx), inst)
+			}
+			release(k)
+			if next == 0 {
+				return nil, fmt.Errorf("fork checkpoint: %w", err)
+			}
+			// Keep the branches already running; report the rest as failed.
+			for i := next; i < spec.N; i++ {
+				res.Branches[i] = controller.Result{Status: runstore.StatusError, Err: fmt.Errorf("fork checkpoint: %w", err)}
+			}
+			break
+		}
+		release(k - len(insts))
+		for _, inst := range insts {
+			i := next
+			next++
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer release(1)
+				// Each branch gets its own copy: branches append to their history.
+				res.Branches[i] = e.Controller.Continue(ctx, spec.Task, inst, spec.Conversation.Clone(), spec.Branch)
+			}()
+		}
 	}
 	wg.Wait()
 
 	for _, b := range res.Branches {
+		res.Usage = res.Usage.Add(b.Usage)
 		if b.Status == runstore.StatusDone {
 			res.Done++
 			if b.Outcome == runstore.OutcomePass {
@@ -184,6 +247,12 @@ func (e *Engine) Fork(ctx context.Context, req Request) (*Result, error) {
 	}
 	res.Lo, res.Hi = stats.Wilson(res.Passes, res.Done, stats.Z95)
 	return res, nil
+}
+
+// Request returns the request body recorded on an LLM step's span, waiting for
+// it to reach the trace store.
+func (e *Engine) Request(ctx context.Context, runID, spanID string) ([]byte, error) {
+	return e.request(ctx, runID, spanID)
 }
 
 // request waits for the recorded request to reach the trace store.

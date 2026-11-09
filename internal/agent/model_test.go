@@ -77,3 +77,22 @@ func TestConversationKeepsMessageBytes(t *testing.T) {
 		t.Fatalf("tool output not replaced: %s", c.Messages[1])
 	}
 }
+
+func TestSetSystemStripsThinkingOnly(t *testing.T) {
+	body := `{"max_tokens":1,"messages":[{"content":[{"text":"go","type":"text"}],"role":"user"},` +
+		`{"content":[{"signature":"c2ln","thinking":"","type":"thinking"},{"id":"toolu_1","input":{"path":"a","content":"b"},"name":"write_file","type":"tool_use"}],"role":"assistant"}],` +
+		`"model":"m","system":[{"text":"old","type":"text"}]}`
+	c, _ := ParseConversation([]byte(body))
+	c.SetSystem("new")
+	if err := c.StripThinking(); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := c.Body()
+	s := string(out)
+	if strings.Contains(s, "thinking") || !strings.Contains(s, `"text":"new"`) {
+		t.Fatalf("got %s", s)
+	}
+	if !strings.Contains(s, `{"id":"toolu_1","input":{"path":"a","content":"b"},"name":"write_file","type":"tool_use"}`) {
+		t.Fatalf("tool_use block changed: %s", s)
+	}
+}

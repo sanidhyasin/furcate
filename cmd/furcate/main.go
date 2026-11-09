@@ -40,6 +40,9 @@ Usage:
   furcate steps <run-id>           a run's steps and their checkpoints
   furcate fork -step k <run-id>    run N continuations from step k, with a change
   furcate branches <run-id>        pass rates of a run's branches
+  furcate bisect <run-id>          find the step where a run went wrong
+  furcate compare <run-a> <run-b>  outcome, cost and final files of two runs
+  furcate eval ...                 checkpoints as test cases: add, list, export, run
 
 Run "furcate <command> -h" for a command's flags.
 `
@@ -79,6 +82,12 @@ func main() {
 		err = runFork(ctx, args)
 	case "branches":
 		err = runBranches(ctx, args)
+	case "bisect":
+		err = runBisect(ctx, args)
+	case "compare":
+		err = runCompare(ctx, args)
+	case "eval":
+		err = runEval(ctx, args)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:

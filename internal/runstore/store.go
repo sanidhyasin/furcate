@@ -10,7 +10,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -45,6 +47,52 @@ type Run struct {
 	Error       string
 	StartedAt   time.Time
 	FinishedAt  time.Time
+	Usage       Usage
+	FinalFiles  map[string]string // path -> sha256 of the workdir when the run ended
+	Eval        EvalTag           // set on runs an eval started
+}
+
+// EvalTag marks a run as one continuation of an eval case under one variant.
+type EvalTag struct {
+	Case, Variant, Batch string
+}
+
+// EvalCase is a checkpoint saved as a test: "resume here; does the agent finish?"
+type EvalCase struct {
+	CaseID       string
+	RunID        string
+	Step         int
+	CheckpointID string
+	Check        []string        // overrides the task's check; nil = the task's
+	Change       json.RawMessage // applied under every variant; nil = none
+	Notes        string
+	CreatedAt    time.Time
+}
+
+// Usage is what a run's model calls consumed.
+type Usage struct {
+	LLMCalls         int
+	InputTokens      int64 // uncached input
+	OutputTokens     int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+	CostUSD          float64
+}
+
+// Add sums two usages.
+func (u Usage) Add(o Usage) Usage {
+	return Usage{
+		LLMCalls: u.LLMCalls + o.LLMCalls, InputTokens: u.InputTokens + o.InputTokens,
+		OutputTokens: u.OutputTokens + o.OutputTokens, CacheReadTokens: u.CacheReadTokens + o.CacheReadTokens,
+		CacheWriteTokens: u.CacheWriteTokens + o.CacheWriteTokens, CostUSD: u.CostUSD + o.CostUSD,
+	}
+}
+
+// End is how a run finished.
+type End struct {
+	Status, Outcome, Error string
+	Usage                  Usage
+	FinalFiles             map[string]string
 }
 
 // Step is one LLM call or tool call. LLM steps carry the checkpoint taken just
@@ -78,7 +126,7 @@ var ErrNotFound = errors.New("runstore: not found")
 // Store is the run state.
 type Store interface {
 	CreateRun(ctx context.Context, r Run) error
-	FinishRun(ctx context.Context, runID, status, outcome, errMsg string) error
+	FinishRun(ctx context.Context, runID string, end End) error
 	AddCheckpoint(ctx context.Context, c Checkpoint) error
 	AddStep(ctx context.Context, s Step) error
 
@@ -87,19 +135,72 @@ type Store interface {
 	Steps(ctx context.Context, runID string) ([]Step, error)
 	Checkpoint(ctx context.Context, checkpointID string) (Checkpoint, error)
 	Children(ctx context.Context, runID string) ([]Run, error)
+
+	// PinCheckpoint marks a checkpoint as used by an eval case: never expired.
+	PinCheckpoint(ctx context.Context, checkpointID string) error
+	AddEvalCase(ctx context.Context, c EvalCase) error
+	EvalCase(ctx context.Context, caseID string) (EvalCase, error)
+	EvalCases(ctx context.Context) ([]EvalCase, error)
 }
 
-// Memory is an in-process Store for tests.
+// Memory is an in-process Store, for tests and for evals run in CI.
 type Memory struct {
 	mu    sync.Mutex
 	runs  map[string]Run
 	steps map[string][]Step
 	cps   map[string]Checkpoint
+	cases map[string]EvalCase
 }
 
 // NewMemory returns an empty store.
 func NewMemory() *Memory {
-	return &Memory{runs: map[string]Run{}, steps: map[string][]Step{}, cps: map[string]Checkpoint{}}
+	return &Memory{runs: map[string]Run{}, steps: map[string][]Step{}, cps: map[string]Checkpoint{}, cases: map[string]EvalCase{}}
+}
+
+func (m *Memory) PinCheckpoint(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.cps[id]
+	if !ok {
+		return ErrNotFound
+	}
+	c.Pinned = true
+	m.cps[id] = c
+	return nil
+}
+
+func (m *Memory) AddEvalCase(_ context.Context, c EvalCase) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, dup := m.cases[c.CaseID]; dup {
+		return fmt.Errorf("eval case %s already exists", c.CaseID)
+	}
+	if c.CreatedAt.IsZero() {
+		c.CreatedAt = time.Now()
+	}
+	m.cases[c.CaseID] = c
+	return nil
+}
+
+func (m *Memory) EvalCase(_ context.Context, id string) (EvalCase, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.cases[id]
+	if !ok {
+		return EvalCase{}, ErrNotFound
+	}
+	return c, nil
+}
+
+func (m *Memory) EvalCases(_ context.Context) ([]EvalCase, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []EvalCase
+	for _, c := range m.cases {
+		out = append(out, c)
+	}
+	slices.SortFunc(out, func(a, b EvalCase) int { return strings.Compare(a.CaseID, b.CaseID) })
+	return out, nil
 }
 
 func (m *Memory) CreateRun(_ context.Context, r Run) error {
@@ -115,14 +216,15 @@ func (m *Memory) CreateRun(_ context.Context, r Run) error {
 	return nil
 }
 
-func (m *Memory) FinishRun(_ context.Context, runID, status, outcome, errMsg string) error {
+func (m *Memory) FinishRun(_ context.Context, runID string, end End) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.runs[runID]
 	if !ok {
 		return ErrNotFound
 	}
-	r.Status, r.Outcome, r.Error, r.FinishedAt = status, outcome, errMsg, time.Now()
+	r.Status, r.Outcome, r.Error, r.FinishedAt = end.Status, end.Outcome, end.Error, time.Now()
+	r.Usage, r.FinalFiles = end.Usage, end.FinalFiles
 	m.runs[runID] = r
 	return nil
 }

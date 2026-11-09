@@ -117,3 +117,57 @@ func (c *Conversation) Clone() *Conversation {
 	}
 	return &Conversation{Head: head, Messages: append([]json.RawMessage(nil), c.Messages...)}
 }
+
+// SetSystem replaces the top-level system prompt. This edits history: thinking
+// blocks produced under the old prompt no longer belong to this conversation,
+// so callers strip them (StripThinking) and accept a cold prompt cache.
+func (c *Conversation) SetSystem(text string) {
+	if text == "" {
+		delete(c.Head, "system")
+		return
+	}
+	b, _ := json.Marshal([]anthropic.TextBlockParam{{Text: text}})
+	c.Head["system"] = b
+}
+
+// StripThinking removes thinking and redacted_thinking blocks from every
+// assistant message. Other blocks keep their bytes.
+func (c *Conversation) StripThinking() error {
+	for i, raw := range c.Messages {
+		var msg map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			return err
+		}
+		var role string
+		json.Unmarshal(msg["role"], &role)
+		if role != "assistant" {
+			continue
+		}
+		var blocks []json.RawMessage
+		if err := json.Unmarshal(msg["content"], &blocks); err != nil {
+			continue // string content: nothing to strip
+		}
+		kept := blocks[:0:0]
+		for _, b := range blocks {
+			var head struct {
+				Type string `json:"type"`
+			}
+			json.Unmarshal(b, &head)
+			if head.Type != "thinking" && head.Type != "redacted_thinking" {
+				kept = append(kept, b)
+			}
+		}
+		if len(kept) == len(blocks) {
+			continue
+		}
+		content, err := json.Marshal(kept)
+		if err != nil {
+			return err
+		}
+		msg["content"] = content
+		if c.Messages[i], err = json.Marshal(msg); err != nil {
+			return err
+		}
+	}
+	return nil
+}

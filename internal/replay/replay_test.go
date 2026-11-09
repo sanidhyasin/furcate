@@ -21,6 +21,7 @@ import (
 
 	"github.com/sanidhyasin/furcate/internal/agent"
 	"github.com/sanidhyasin/furcate/internal/controller"
+	"github.com/sanidhyasin/furcate/internal/driver"
 	"github.com/sanidhyasin/furcate/internal/driver/testdir"
 	"github.com/sanidhyasin/furcate/internal/runstore"
 	"github.com/sanidhyasin/furcate/internal/stats"
@@ -251,6 +252,60 @@ func TestChangesAreAppendOnly(t *testing.T) {
 	first, _ := agent.ParseConversation(b1)
 	if err := (Change{ToolOutput: &out}).Apply(first); err == nil {
 		t.Fatal("want an error replacing a tool output at step 1")
+	}
+}
+
+// countingDriver records the most sandboxes alive at once.
+type countingDriver struct {
+	*testdir.Driver
+	mu         sync.Mutex
+	live, peak int
+}
+
+func (d *countingDriver) Create(ctx context.Context, tmpl string) (driver.Instance, error) {
+	inst, err := d.Driver.Create(ctx, tmpl)
+	d.add(1)
+	return inst, err
+}
+
+func (d *countingDriver) Fork(ctx context.Context, cp driver.CheckpointID, n int, offline bool) ([]driver.Instance, error) {
+	insts, err := d.Driver.Fork(ctx, cp, n, offline)
+	d.add(len(insts))
+	return insts, err
+}
+
+func (d *countingDriver) Destroy(ctx context.Context, inst driver.Instance) error {
+	d.add(-1)
+	return d.Driver.Destroy(ctx, inst)
+}
+
+func (d *countingDriver) add(n int) {
+	d.mu.Lock()
+	d.live += n
+	d.peak = max(d.peak, d.live)
+	d.mu.Unlock()
+}
+
+func TestSlotsBoundConcurrentBranches(t *testing.T) {
+	h := newHarness(t)
+	cd := &countingDriver{Driver: h.drv}
+	h.ctl.Driver = cd
+	h.ctl.Slots = controller.NewSlots(2)
+	ctx := context.Background()
+	orig := h.ctl.Start(ctx, h.task)
+	res, err := h.engine.Fork(ctx, Request{RunID: orig.RunID, Step: 5, N: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Done != 7 || cd.peak > 2 || cd.live != 0 {
+		t.Fatalf("done %d, peak %d sandboxes (limit 2), %d left alive", res.Done, cd.peak, cd.live)
+	}
+	if res.Usage.LLMCalls != 7*2 || res.Usage.CostUSD <= 0 {
+		t.Fatalf("usage %+v: want 2 LLM calls per branch and a cost", res.Usage)
+	}
+	r, _ := h.store.Run(ctx, orig.RunID)
+	if r.FinalFiles["./notes/plan.md"] == "" {
+		t.Fatalf("final manifest missing notes/plan.md: %v", r.FinalFiles)
 	}
 }
 

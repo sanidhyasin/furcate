@@ -40,7 +40,9 @@ func TestPostgresStore(t *testing.T) {
 	if err := pg.AddStep(ctx, Step{RunID: id, Index: 2, SpanID: "s2", Kind: KindTool}); err != nil {
 		t.Fatal(err)
 	}
-	if err := pg.FinishRun(ctx, id, StatusDone, OutcomeFail, ""); err != nil {
+	if err := pg.FinishRun(ctx, id, End{Status: StatusDone, Outcome: OutcomeFail,
+		Usage:      Usage{LLMCalls: 3, InputTokens: 10, OutputTokens: 5, CostUSD: 0.25},
+		FinalFiles: map[string]string{"./a.txt": "abc"}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -51,7 +53,8 @@ func TestPostgresStore(t *testing.T) {
 	}
 
 	r, err := pg.Run(ctx, id)
-	if err != nil || r.Status != StatusDone || r.Outcome != OutcomeFail || r.ParentRunID != "" || r.FinishedAt.IsZero() {
+	if err != nil || r.Status != StatusDone || r.Outcome != OutcomeFail || r.ParentRunID != "" || r.FinishedAt.IsZero() ||
+		r.Usage.LLMCalls != 3 || r.Usage.CostUSD != 0.25 || r.FinalFiles["./a.txt"] != "abc" {
 		t.Fatalf("run: %+v %v", r, err)
 	}
 	steps, _ := pg.Steps(ctx, id)

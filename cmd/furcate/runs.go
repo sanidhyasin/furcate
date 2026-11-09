@@ -19,8 +19,10 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 
 	"github.com/sanidhyasin/furcate/internal/agent"
+	"github.com/sanidhyasin/furcate/internal/bisect"
 	"github.com/sanidhyasin/furcate/internal/controller"
 	"github.com/sanidhyasin/furcate/internal/driver"
+	"github.com/sanidhyasin/furcate/internal/pricing"
 	"github.com/sanidhyasin/furcate/internal/replay"
 	"github.com/sanidhyasin/furcate/internal/runstore"
 	"github.com/sanidhyasin/furcate/internal/stats"
@@ -62,11 +64,16 @@ type env struct {
 	cleanup func()
 }
 
-func openEnv(ctx context.Context, dsn, pgDSN, otlp, driverName string, fallbacks, keep bool) (*env, error) {
-	sb, err := newDriver(driverName)
+func openEnv(ctx context.Context, f runFlags) (*env, error) {
+	sb, err := newDriver(*f.driver)
 	if err != nil {
 		return nil, err
 	}
+	prices, err := pricing.Load(*f.prices)
+	if err != nil {
+		return nil, fmt.Errorf("prices: %w", err)
+	}
+	dsn, pgDSN, otlp := *f.dsn, *f.pg, *f.otlp
 	ch, err := store.Open(ctx, dsn)
 	if err != nil {
 		return nil, err
@@ -85,8 +92,9 @@ func openEnv(ctx context.Context, dsn, pgDSN, otlp, driverName string, fallbacks
 	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(exp),
 		sdktrace.WithResource(resource.NewSchemaless(semconv.ServiceName("furcate-agent"))))
 	e := &env{ch: ch, pg: pg, tp: tp, ctl: &controller.Controller{
-		Driver: sb, Model: agent.NewAnthropic(fallbacks), Store: pg, Tracer: tp.Tracer("furcate"),
-		Log: slog.New(slog.NewTextHandler(os.Stderr, nil)), Keep: keep,
+		Driver: sb, Model: agent.NewAnthropic(!*f.noFallbacks), Store: pg, Tracer: tp.Tracer("furcate"),
+		Log: slog.New(slog.NewTextHandler(os.Stderr, nil)), Keep: *f.keep, Prices: prices,
+		Slots: controller.NewSlots(*f.maxSandboxes),
 	}}
 	e.cleanup = func() {
 		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -99,17 +107,20 @@ func openEnv(ctx context.Context, dsn, pgDSN, otlp, driverName string, fallbacks
 }
 
 type runFlags struct {
-	dsn, pg, otlp, driver *string
-	noFallbacks, keep     *bool
+	dsn, pg, otlp, driver, prices *string
+	noFallbacks, keep             *bool
+	maxSandboxes                  *int
 }
 
 func addRunFlags(fs *flag.FlagSet) runFlags {
 	return runFlags{
 		dsn: dsnFlag(fs), pg: pgFlag(fs),
-		otlp:        fs.String("otlp", envOr("FURCATE_OTLP", "http://localhost:4318"), "collector OTLP/HTTP base URL (env FURCATE_OTLP)"),
-		driver:      fs.String("driver", envOr("FURCATE_DRIVER", "tine"), "sandbox driver (env FURCATE_DRIVER)"),
-		noFallbacks: fs.Bool("no-fallbacks", false, "don't let the API re-serve a refused request with a fallback model"),
-		keep:        fs.Bool("keep", false, "leave sandboxes running after the run, for inspection"),
+		otlp:         fs.String("otlp", envOr("FURCATE_OTLP", "http://localhost:4318"), "collector OTLP/HTTP base URL (env FURCATE_OTLP)"),
+		driver:       fs.String("driver", envOr("FURCATE_DRIVER", "tine"), "sandbox driver (env FURCATE_DRIVER)"),
+		noFallbacks:  fs.Bool("no-fallbacks", false, "don't let the API re-serve a refused request with a fallback model"),
+		keep:         fs.Bool("keep", false, "leave sandboxes running after the run, for inspection"),
+		prices:       fs.String("prices", "", "JSON price table on top of the built-in Claude prices"),
+		maxSandboxes: fs.Int("max-sandboxes", 16, "most sandboxes this process runs at once; forks queue for a slot"),
 	}
 }
 
@@ -125,13 +136,14 @@ func runRun(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	e, err := openEnv(ctx, *f.dsn, *f.pg, *f.otlp, *f.driver, !*f.noFallbacks, *f.keep)
+	e, err := openEnv(ctx, f)
 	if err != nil {
 		return err
 	}
 	defer e.cleanup()
 	res := e.ctl.Start(ctx, t)
-	fmt.Printf("run %s  %s  outcome=%s  steps=%d\n", res.RunID, res.Status, orDash(res.Outcome), res.Steps)
+	fmt.Printf("run %s  %s  outcome=%s  steps=%d  %d LLM calls  $%.4f  %s\n", res.RunID, res.Status, orDash(res.Outcome),
+		res.Steps, res.Usage.LLMCalls, res.Usage.CostUSD, res.Duration.Round(time.Millisecond))
 	if res.Err != nil {
 		return res.Err
 	}
@@ -157,7 +169,7 @@ func runFork(ctx context.Context, args []string) error {
 			ch.ToolOutput = toolOutput
 		}
 	})
-	e, err := openEnv(ctx, *f.dsn, *f.pg, *f.otlp, *f.driver, !*f.noFallbacks, *f.keep)
+	e, err := openEnv(ctx, f)
 	if err != nil {
 		return err
 	}
@@ -169,8 +181,8 @@ func runFork(ctx context.Context, args []string) error {
 		return err
 	}
 	fmt.Printf("fork of %s at step %d, change: %s\n", res.RunID, res.Step, res.Change)
-	fmt.Printf("passed %d of %d  (95%% CI %.2f-%.2f)  in %s\n", res.Passes, res.Done, res.Lo, res.Hi,
-		time.Since(start).Round(time.Millisecond))
+	fmt.Printf("passed %d of %d  (95%% CI %.2f-%.2f)  in %s  $%.4f\n", res.Passes, res.Done, res.Lo, res.Hi,
+		time.Since(start).Round(time.Millisecond), res.Usage.CostUSD)
 	for _, b := range res.Branches {
 		line := fmt.Sprintf("  %s  %s  %s", b.RunID, b.Status, orDash(b.Outcome))
 		if b.Err != nil {
@@ -295,4 +307,166 @@ func orDash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+func runBisect(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("bisect", flag.ExitOnError)
+	f := addRunFlags(fs)
+	n := fs.Int("n", 10, "continuations per probe")
+	maxRuns := fs.Int("max-runs", 100, "budget: most continuations in total")
+	maxUSD := fs.Float64("max-usd", 0, "budget: most dollars in total (0 = no cap)")
+	fs.Parse(args)
+	if fs.NArg() != 1 {
+		return errors.New("usage: furcate bisect [-n 10] [-max-runs 100] [-max-usd 20] <run-id>")
+	}
+	e, err := openEnv(ctx, f)
+	if err != nil {
+		return err
+	}
+	defer e.cleanup()
+	eng := &replay.Engine{Controller: e.ctl, Store: e.pg, Conversations: e.ch}
+	res, err := bisect.Run(ctx, eng, bisect.Config{RunID: fs.Arg(0), N: *n, MaxRuns: *maxRuns, MaxUSD: *maxUSD,
+		Log: func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("\nbisect of %s (checkpointed steps %v)\n", res.RunID, res.Steps)
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "STEP\tPASSED\tRATE\t95% CI\tERRORS\tCOST")
+	probes := slices.Clone(res.Probes)
+	slices.SortFunc(probes, func(a, b *bisect.Probe) int { return a.Step - b.Step })
+	for _, p := range probes {
+		fmt.Fprintf(tw, "%d\t%d/%d\t%.0f%%\t%.2f-%.2f\t%d\t$%.4f\n", p.Step, p.Passes, p.Done, p.Rate()*100, p.Lo, p.Hi, p.Errors, p.Usage.CostUSD)
+	}
+	tw.Flush()
+	fmt.Printf("\n%s\n", res.Verdict)
+	if res.Faulty > 0 {
+		describeStep(ctx, e, res.RunID, res.Faulty, res.FirstBad.Step)
+	}
+	ratio := ""
+	if res.Original.CostUSD > 0 {
+		ratio = fmt.Sprintf(" = %.1f times the original run", res.Usage.CostUSD/res.Original.CostUSD)
+	}
+	fmt.Printf("\ncost: %d continuations, %d LLM calls, %d output tokens, $%.4f%s, %s\n", res.Runs, res.Usage.LLMCalls,
+		res.Usage.OutputTokens, res.Usage.CostUSD, ratio, res.Duration.Round(time.Millisecond))
+	if !res.Confident {
+		fmt.Println("low confidence: some probes never separated; rerun with a larger -n")
+	}
+	return nil
+}
+
+// describeStep prints what the run did between an LLM step and the next one:
+// the tool calls that followed the decision.
+func describeStep(ctx context.Context, e *env, runID string, from, to int) {
+	steps, err := e.pg.Steps(ctx, runID)
+	if err != nil {
+		return
+	}
+	spans, err := e.ch.Trace(ctx, runID, true)
+	if err != nil {
+		return
+	}
+	byID := map[string]string{}
+	for _, s := range spans {
+		desc := s.Name
+		if args := s.Attributes["gen_ai.tool.call.arguments"]; args != "" {
+			desc += " " + args
+		}
+		byID[s.SpanID] = desc
+	}
+	fmt.Printf("what step %d did:\n", from)
+	for _, s := range steps {
+		if s.Index >= from && s.Index < to {
+			fmt.Printf("  %d %s %s\n", s.Index, s.Kind, byID[s.SpanID])
+		}
+	}
+}
+
+func runCompare(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("compare", flag.ExitOnError)
+	pgDSN := pgFlag(fs)
+	fs.Parse(args)
+	if fs.NArg() != 2 {
+		return errors.New("usage: furcate compare <run-a> <run-b>")
+	}
+	pg, err := runstore.OpenPostgres(ctx, *pgDSN)
+	if err != nil {
+		return err
+	}
+	defer pg.Close()
+	var runs [2]runstore.Run
+	for i := range runs {
+		if runs[i], err = pg.Run(ctx, fs.Arg(i)); err != nil {
+			return fmt.Errorf("%s: %w", fs.Arg(i), err)
+		}
+	}
+	a, b := runs[0], runs[1]
+	dur := func(r runstore.Run) string {
+		if r.FinishedAt.IsZero() {
+			return "-"
+		}
+		return r.FinishedAt.Sub(r.StartedAt).Round(time.Millisecond).String()
+	}
+	origin := func(r runstore.Run) string {
+		if r.ParentRunID == "" {
+			return "original"
+		}
+		return fmt.Sprintf("branch of %s at step %d %s", short(r.ParentRunID), r.ParentStep, r.Change)
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(tw, "\tA %s\tB %s\n", short(a.RunID), short(b.RunID))
+	rows := [][3]string{
+		{"origin", origin(a), origin(b)},
+		{"outcome", orDash(a.Outcome), orDash(b.Outcome)},
+		{"status", a.Status, b.Status},
+		{"LLM calls", fmt.Sprint(a.Usage.LLMCalls), fmt.Sprint(b.Usage.LLMCalls)},
+		{"input tokens (uncached)", fmt.Sprint(a.Usage.InputTokens), fmt.Sprint(b.Usage.InputTokens)},
+		{"cache read tokens", fmt.Sprint(a.Usage.CacheReadTokens), fmt.Sprint(b.Usage.CacheReadTokens)},
+		{"output tokens", fmt.Sprint(a.Usage.OutputTokens), fmt.Sprint(b.Usage.OutputTokens)},
+		{"cost", fmt.Sprintf("$%.4f", a.Usage.CostUSD), fmt.Sprintf("$%.4f", b.Usage.CostUSD)},
+		{"duration", dur(a), dur(b)},
+	}
+	for _, r := range rows {
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", r[0], r[1], r[2])
+	}
+	tw.Flush()
+
+	if a.FinalFiles == nil || b.FinalFiles == nil {
+		fmt.Println("\nfiles: no final manifest for one of the runs")
+		return nil
+	}
+	var onlyA, onlyB, changed []string
+	for _, p := range controller.SortedPaths(a.FinalFiles) {
+		hb, ok := b.FinalFiles[p]
+		switch {
+		case !ok:
+			onlyA = append(onlyA, p)
+		case hb != a.FinalFiles[p]:
+			changed = append(changed, p)
+		}
+	}
+	for _, p := range controller.SortedPaths(b.FinalFiles) {
+		if _, ok := a.FinalFiles[p]; !ok {
+			onlyB = append(onlyB, p)
+		}
+	}
+	fmt.Printf("\nfiles at the end: %d in A, %d in B; %d differ, %d only in A, %d only in B\n",
+		len(a.FinalFiles), len(b.FinalFiles), len(changed), len(onlyA), len(onlyB))
+	for _, p := range changed {
+		fmt.Println("  ~ " + p)
+	}
+	for _, p := range onlyA {
+		fmt.Println("  - " + p + "  (only in A)")
+	}
+	for _, p := range onlyB {
+		fmt.Println("  + " + p + "  (only in B)")
+	}
+	return nil
+}
+
+func short(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }
