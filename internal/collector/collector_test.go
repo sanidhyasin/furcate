@@ -382,18 +382,18 @@ func TestGRPCExport(t *testing.T) {
 // slowWriter records how many inserts run at once. Its first insert is the
 // slowest, so later batches finish before it.
 type slowWriter struct {
-	mu                sync.Mutex
-	live, peak, calls int
-	spans             []model.Span
+	mu         sync.Mutex
+	live, peak int
+	spans      []model.Span
 }
 
 func (w *slowWriter) Insert(_ context.Context, s []model.Span) error {
 	w.mu.Lock()
 	w.live++
 	w.peak = max(w.peak, w.live)
-	w.calls++
+	// Record 1's batch is the slow one, whichever worker calls first.
 	d := 20 * time.Millisecond
-	if w.calls == 1 {
+	if len(s) > 0 && s[0].WALSeq == 1 {
 		d = 400 * time.Millisecond
 	}
 	w.mu.Unlock()
