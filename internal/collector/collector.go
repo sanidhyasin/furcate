@@ -38,8 +38,8 @@ import (
 
 // Config sets up a collector. Zero values get the defaults in New.
 type Config struct {
-	HTTPAddr string // OTLP/HTTP, default :4318
-	GRPCAddr string // OTLP/gRPC, default :4317; "off" disables it
+	HTTPAddr string // OTLP/HTTP, default 127.0.0.1:4318
+	GRPCAddr string // OTLP/gRPC, default 127.0.0.1:4317; "off" disables it
 
 	WALDir         string
 	WALSegmentSize int64
@@ -61,10 +61,10 @@ type Config struct {
 
 func (c *Config) defaults() {
 	if c.HTTPAddr == "" {
-		c.HTTPAddr = ":4318"
+		c.HTTPAddr = "127.0.0.1:4318"
 	}
 	if c.GRPCAddr == "" {
-		c.GRPCAddr = ":4317"
+		c.GRPCAddr = "127.0.0.1:4317"
 	}
 	if c.WALDir == "" {
 		c.WALDir = "data/wal"

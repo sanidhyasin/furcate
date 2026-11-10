@@ -124,8 +124,8 @@ func runCollector(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("collector", flag.ExitOnError)
 	dsn := dsnFlag(fs)
 	var cfg collector.Config
-	fs.StringVar(&cfg.HTTPAddr, "http", ":4318", "OTLP/HTTP listen address")
-	fs.StringVar(&cfg.GRPCAddr, "grpc", ":4317", `OTLP/gRPC listen address ("off" to disable)`)
+	fs.StringVar(&cfg.HTTPAddr, "http", "127.0.0.1:4318", "OTLP/HTTP listen address (\":4318\" for every interface)")
+	fs.StringVar(&cfg.GRPCAddr, "grpc", "127.0.0.1:4317", `OTLP/gRPC listen address ("off" to disable)`)
 	fs.StringVar(&cfg.WALDir, "wal-dir", envOr("FURCATE_WAL_DIR", "data/wal"), "write-ahead log directory")
 	fs.IntVar(&cfg.BatchSize, "batch-size", 10_000, "insert into ClickHouse at this many spans")
 	fs.DurationVar(&cfg.FlushInterval, "flush-interval", time.Second, "or after this long")
