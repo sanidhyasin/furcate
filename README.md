@@ -12,11 +12,12 @@ Design doc: <https://claude.ai/artifact/QsPmNLTXC9aALQR5ZT1hTK>
 ## Status
 
 All five phases are built and tested, and every gate has been met with Claude
-Opus 5.5, on Docker and on tine. The c5d.metal numbers are still to do.
+Opus 5.5, on Docker and on tine, and the numbers below include a bare-metal run
+(c5d.metal).
 
 | Phase | Built | Gate | State |
 | --- | --- | --- | --- |
-| 1 | OTLP collector with a write-ahead log, ClickHouse trace store, payload table, CLI, load generator | ingest and query numbers published | laptop numbers below; c5d.metal pending |
+| 1 | OTLP collector with a write-ahead log, ClickHouse trace store, payload table, CLI, load generator | ingest and query numbers published | **met**: laptop and c5d.metal |
 | 2 | driver interface; tine and Docker drivers; run controller; `furcate fork` | a fork of step k matches its files and conversation; step overhead measured | **met on tine** |
 | 3 | bisect, branch compare, fork scheduler, checkpoint gc | bisect finds the faulty step of a real failure on tine and Docker | **met**: both name step 5 of a real Opus 5.5 failure |
 | 4 | eval cases, portable bundles, `furcate eval run`, GitHub Action | a prompt change in a real repo shows its pass-rate change on the PR | **met locally** (7/30 to 30/30); the PR comment needs the key as a repo secret |
@@ -69,11 +70,15 @@ Any OpenTelemetry SDK can also send plain traces to `http://localhost:4318/v1/tr
 
 - **Collector** (`internal/collector`): OTLP/HTTP and gRPC. A request is
   acknowledged only after it is in the write-ahead log (`internal/wal`); it answers
-  503 when its queue is full. Payloads (prompts, completions, tool I/O) go to their
-  own table, stored once per SHA-256.
+  503 when its queue is full. Batches go to ClickHouse on several inserters at
+  once (`-inserters`, 4 by default); a log record is released once all its spans
+  have landed, in whatever order. Payloads (prompts, completions, tool I/O) go to
+  their own table, stored once per SHA-256.
 - **Run controller** (`internal/controller`): the agent loop runs on the host, and
-  tools (`bash`, `write_file`) run in the sandbox. Before every LLM call it takes a
-  checkpoint; the call's full request body goes on its span.
+  tools (`bash`, `write_file`) run in the sandbox. Every LLM call gets a checkpoint,
+  taken while the call is in flight (the agent can't change the sandbox until the
+  reply comes), and the step waits for it only before running tools. The call's
+  full request body goes on its span.
 - **Fork** (`internal/replay`): restores step k's checkpoint into N sandboxes
   (offline if the driver can), resends the recorded request with a change, and runs
   the continuations in parallel under a per-process sandbox limit. Changes are
@@ -106,7 +111,7 @@ Any OpenTelemetry SDK can also send plain traces to `http://localhost:4318/v1/tr
 
 ## Results so far
 
-Hardware and method for each line; nothing here is from the c5d.metal yet.
+Hardware and method for each line.
 
 **Real agent runs**, Claude Opus 5.5 (effort high), the `csv-report` example
 ([details](examples/csv-report/README.md)); Docker Desktop on an Apple M5, tine on
@@ -149,6 +154,34 @@ cost $20.47 (2,351 calls).
 | Storage per span | 2,046 B with payloads; payloads compress 4.7x |
 | Crash (kill -9 mid-load) | 56,616 spans acknowledged, 56,763 stored: none lost |
 
+(Measured with one insert at a time, before the collector had inserters.)
+
+**Trace store on bare metal**: AWS c5d.metal (96 vCPUs, Xeon Platinum 8275CL,
+188 GiB, local NVMe), with the collector, the load generator and ClickHouse 25.8
+(in Docker) on that one host, `furcate loadgen -steps 10`:
+
+| Collector, senders, duration | Spans/s | Runs/s | Payloads | Insert p50 / p99 |
+| --- | --- | --- | --- | --- |
+| one insert at a time, 16, 30 s | 14,464 | 689 | 155 MiB/s | 660 ms / 1.07 s |
+| one insert at a time, 64, 30 s | 14,429 | 687 | 155 MiB/s | 669 ms / 939 ms |
+| 4 inserters, 64, 30 s | 45,822 | 2,182 | 491 MiB/s | 813 ms / 1.35 s |
+| 8 inserters, 64, 30 s | 53,745 | 2,559 | 576 MiB/s | 893 ms / 1.52 s |
+| 8 inserters, 64, 10 min | 37,945 | 1,807 | 407 MiB/s | 803 ms / 1.22 s |
+
+With one insert at a time ClickHouse used 2 of the 96 cores and more senders only
+meant more 503s; with 8 inserters it used about 10, and 128 senders gave no more
+than 64. Over 10 minutes, background merges bring the rate down to 38k. No run
+lost a span: every retry was a 503 the load generator resent.
+
+Then, with 30.0M spans and 57M payloads in the tables (`furcate bench -n 50`):
+
+| Metric | Result |
+| --- | --- |
+| Load one trace, with the trace index | p50 28 ms, p95 52 ms |
+| Load one trace, full scan | p50 39 ms, p95 55 ms |
+| Stats by model, 24 h | rollups p50 7 ms; raw spans 88 ms |
+| Storage per span | 2,064 B with payloads; payloads compress 4.7x, dedupe 1.3x |
+
 **Checkpoints and forks on tine**, AWS m8i.xlarge (4 vCPU, nested virtualization),
 1 GiB VMs, EBS, a 4-step scripted agent (`internal/driver/tine/gate_test.go`):
 
@@ -161,6 +194,29 @@ cost $20.47 (2,351 calls).
 A fork of step 5 had the checkpoint's files, a counter process started at step 1
 still running from its in-memory value, no network ("network unreachable"), and its
 first request byte-identical to the recorded one.
+
+**Checkpoints and forks on bare metal**: AWS c5d.metal (96 vCPUs, Xeon Platinum
+8275CL, 188 GiB, local NVMe), tine v0.5.0, 1 GiB 2-vCPU VMs of the `base` image.
+`internal/driver/tine/bench_test.go`, run on the host over tined's socket: 3 VMs x
+20 steps, each step writing 1 MiB with a process running, then checkpointing; forks
+of the last checkpoint after its VM was gone, offline, 5 times each. p50 (p95):
+
+| Metric | Full snapshots | Diff snapshots |
+| --- | --- | --- |
+| A VM's first checkpoint | 321 ms (836 ms) | 24 ms (693 ms) |
+| Each later checkpoint, back to back | 3.16 s (3.56 s) | 2.15 s (2.18 s) |
+| Fork 1 VM: running / answered a command | 40 ms / 44 ms | 38 ms / 43 ms |
+| Fork 10 VMs | 65 ms / 73 ms | 66 ms / 73 ms |
+| Fork 50 VMs | 167 ms / 204 ms | 189 ms / 220 ms |
+| Fork 100 VMs | 336 ms / 410 ms | 351 ms / 424 ms |
+| Delete a checkpoint | 1 ms | 1 ms |
+
+A later checkpoint is slow because tine makes a VM's next snapshot wait until the
+previous one is on disk and then 2 s more (it found that snapshots taken sooner
+were throttled); the VM runs meanwhile. Furcate takes each checkpoint while the
+model call is in flight, so a step waits only for whatever is left of it when the
+model answers. The scripted case study below took 20 s here for 40
+continuations, against 28 s on the m8i.xlarge.
 
 **Docker**, Apple M5: checkpoint 46 ms, fork of 3 containers 197 ms.
 
@@ -198,8 +254,12 @@ files, both get the same answer and Docker wins on time.
 - **Conversations are raw JSON, never re-encoded.** Decoding a recorded request
   into the SDK's typed params reorders earlier tool-input keys, so a branch would
   send history the model never saw.
-- **A checkpoint before every LLM call**, and a branch reuses its parent's for its
-  first step.
+- **A checkpoint for every LLM call, taken during the call**, and a branch reuses
+  its parent's for its first step. In real runs on tine (bare metal, csv-report,
+  8 runs each) checkpoints blocked a run for 0.5 to 1.0 s in all, about 150 ms a
+  step; taken during the call (4.1 to 4.4 s on average), they block it for none.
+- **Several inserts at once.** One at a time capped ingest at 14.5k spans/s on a
+  96-core host with ClickHouse using 2 cores; 8 inserters reach 53.7k.
 - **Drop-in at level 2 first**, as the doc suggests: restore the agent's transcript
   and resume. Keeping the waiting process needs tine and an in-sandbox shim.
 - **Refusal fallbacks on by default** (`-no-fallbacks` to turn off); spans record

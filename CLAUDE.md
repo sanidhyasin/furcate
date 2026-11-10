@@ -22,6 +22,15 @@ sandbox driver, then fork, bisect and build evals from any step. Working name wa
   Before `./scripts/dev-server.sh stop`: delete leftover retained snapshots (they hold
   disk) and remove any systemd override you added. The user wants no idle AWS
   charges. c5d.metal costs $4.75/h: batch work before starting it.
+- Bare metal (done once, 2026-11-10, ~31 min, ~$2.50): from ../tine, `TINE_NAME=tine-metal
+  TINE_INSTANCE_TYPE=c5d.metal TINE_LOCAL_DATA=1 TINE_ZONE=ap-south-1b
+  ./scripts/dev-server.sh up` (1a had no capacity), then `setup`, `make deploy`,
+  `make base-image` with the same env. Run Furcate's benchmarks on the host over
+  unix:///run/tine/tine.sock (cross-compile with GOOS=linux GOARCH=amd64). The
+  host's Docker has no bridge network: run ClickHouse with --network host and a
+  config.d file that sets listen_host to 127.0.0.1. Terminate with
+  `echo tine-metal | ./scripts/dev-server.sh down`; a .metal can sit in
+  shutting-down for over 10 minutes (billing stops at shutting-down).
 - Claude API access: use only the user's Anthropic key, the one tine uses. It is
   `ANTHROPIC_API_KEY` here (loaded from the keychain item `anthropic-api-key`) and
   the same key as `~/.config/tine/anthropic-api-key`. A 401 seen earlier on
@@ -68,7 +77,8 @@ sandbox driver, then fork, bisect and build evals from any step. Working name wa
 
 - Crash recovery is at-least-once: about 1 s of flushed records replay as
   duplicate rows. Trace reads dedupe by span_id; rollups don't.
-- The trace_index only beats a full scan on large tables; not yet measured at scale.
+- The trace_index barely helps: at 30M spans a trace loads in 28 ms with it, 39 ms
+  without (p50, c5d.metal).
 - `runs` lists a run only once its root span arrives, so in-progress runs are hidden.
 - `testdir` is test-only (no isolation) and must stay out of the CLI.
 - Checkpoints expire only through `furcate gc`; nothing runs it on a schedule.
