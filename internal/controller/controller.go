@@ -78,15 +78,20 @@ type Result struct {
 	Steps    int    // last step index
 	Usage    runstore.Usage
 	Duration time.Duration
-	Err      error
+	// Checkpoints taken and the time they took: the per-step overhead.
+	Checkpoints    int
+	CheckpointTime time.Duration
+	Err            error
 }
 
 // runState is one run in progress.
 type runState struct {
-	id    string
-	start time.Time
-	usage runstore.Usage
-	files map[string]string
+	id     string
+	start  time.Time
+	usage  runstore.Usage
+	files  map[string]string
+	cps    int
+	cpTime time.Duration
 }
 
 // Branch says where a continuation came from.
@@ -144,6 +149,9 @@ func (c *Controller) Start(ctx context.Context, t *task.Task) Result {
 	}
 	defer c.destroy(inst)
 
+	if err := c.copyFiles(ctx, inst, t); err != nil {
+		return c.finish(ctx, root, rs, 0, "", err)
+	}
 	for _, cmd := range t.Setup {
 		res, err := c.Driver.Exec(ctx, inst, driver.ExecRequest{Args: cmd, Dir: t.Workdir, Timeout: t.ToolTimeout.Duration})
 		if err == nil && res.ExitCode != 0 {
@@ -207,6 +215,8 @@ func (c *Controller) drive(ctx context.Context, root trace.Span, rs *runState, t
 			if cpID, cpDur, err = c.checkpoint(ctx, rs.id, step, inst); err != nil {
 				return c.finish(ctx, root, rs, step, "", err)
 			}
+			rs.cps++
+			rs.cpTime += cpDur
 		}
 		firstCP = ""
 
@@ -392,7 +402,28 @@ func (c *Controller) finish(ctx context.Context, root trace.Span, rs *runState, 
 		runErr = errors.Join(runErr, fmt.Errorf("record finish: %w", err))
 	}
 	return Result{RunID: rs.id, Status: status, Outcome: outcome, Steps: lastStep, Usage: rs.usage,
-		Duration: time.Since(rs.start), Err: runErr}
+		Duration: time.Since(rs.start), Checkpoints: rs.cps, CheckpointTime: rs.cpTime, Err: runErr}
+}
+
+// copyFiles unpacks the task's local files into the workdir.
+func (c *Controller) copyFiles(ctx context.Context, inst driver.Instance, t *task.Task) error {
+	if t.Workdir != "" {
+		if res, err := c.Driver.Exec(ctx, inst, driver.ExecRequest{Args: []string{"mkdir", "-p", t.Workdir}}); err != nil || res.ExitCode != 0 {
+			return fmt.Errorf("create workdir: %v %s", err, res.Stderr)
+		}
+	}
+	tgz, err := t.Archive()
+	if err != nil || tgz == nil {
+		return err
+	}
+	res, err := c.Driver.Exec(ctx, inst, driver.ExecRequest{Args: []string{"tar", "xzf", "-"}, Stdin: tgz, Dir: t.Workdir, Timeout: 5 * time.Minute})
+	if err == nil && res.ExitCode != 0 {
+		err = fmt.Errorf("exit %d: %s", res.ExitCode, res.Stderr)
+	}
+	if err != nil {
+		return fmt.Errorf("copy task files: %w", err)
+	}
+	return nil
 }
 
 // MaxManifestFiles bounds the final-files manifest.

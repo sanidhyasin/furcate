@@ -1,0 +1,30 @@
+# Runs the csv-report agent's eval cases whenever a pull request changes the
+# agent or its cases, and posts the pass rates on the pull request.
+name: eval
+on:
+  pull_request:
+    paths:
+      - examples/csv-report/**
+      - evals/**
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  eval:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for the API key
+        id: key
+        env:
+          KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
+          else echo "::warning::Add an ANTHROPIC_API_KEY repository secret to run the eval"; fi
+      - if: steps.key.outputs.ok == 'true'
+        uses: ./
+        with:
+          task: examples/csv-report/task.json
+          cases: evals/cases
+          n: "5"
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}

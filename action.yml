@@ -1,0 +1,58 @@
+name: Furcate eval
+description: >-
+  Run Furcate eval cases (checkpoints of real agent runs) under the pull
+  request's agent prompt and the base branch's, and post both pass rates, with
+  95% intervals and their difference, on the pull request.
+inputs:
+  task:
+    description: Task spec (JSON) whose system prompt the pull request may change.
+    required: true
+  cases:
+    description: Directory of eval case bundles (furcate eval export).
+    default: evals/cases
+  n:
+    description: Continuations per case and variant.
+    default: "5"
+  driver:
+    description: Sandbox driver. GitHub-hosted runners have Docker.
+    default: docker
+  anthropic-api-key:
+    description: Claude API key for the agent's model calls.
+    required: true
+  github-token:
+    description: Token that can comment on the pull request.
+    default: ${{ github.token }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@v5
+      with:
+        go-version-file: ${{ github.action_path }}/go.mod
+        cache: false
+    - name: Build furcate
+      shell: bash
+      run: cd "${{ github.action_path }}" && go build -o "$RUNNER_TEMP/furcate" ./cmd/furcate
+    - name: Base branch's prompt
+      shell: bash
+      run: |
+        git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+        git show "FETCH_HEAD:${{ inputs.task }}" > "$RUNNER_TEMP/base-task.json"
+    - name: Run the eval
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+      run: |
+        "$RUNNER_TEMP/furcate" eval run -store memory -driver "${{ inputs.driver }}" \
+          -cases "${{ inputs.cases }}" -n "${{ inputs.n }}" \
+          -variant "name=${{ github.base_ref }},system-file=$RUNNER_TEMP/base-task.json" \
+          -variant "name=this PR,system-file=${{ inputs.task }}" \
+          -markdown "$RUNNER_TEMP/eval.md"
+    - name: Comment on the pull request
+      if: always() && hashFiles(format('{0}/eval.md', runner.temp)) != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        pr="${{ github.event.pull_request.number }}"
+        gh pr comment "$pr" --edit-last --body-file "$RUNNER_TEMP/eval.md" 2>/dev/null ||
+          gh pr comment "$pr" --body-file "$RUNNER_TEMP/eval.md"

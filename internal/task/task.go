@@ -3,10 +3,15 @@
 package task
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -15,6 +20,7 @@ type Task struct {
 	ID       string     `json:"id"`
 	Template string     `json:"template"`        // the driver's template: an image name on tine
 	Workdir  string     `json:"workdir"`         // where tools run inside the sandbox
+	Files    string     `json:"files,omitempty"` // local directory copied into the workdir before setup
 	Setup    [][]string `json:"setup,omitempty"` // commands run before step 1
 	System   string     `json:"system"`
 	Prompt   string     `json:"prompt"`
@@ -51,13 +57,83 @@ const (
 	DefaultTimeout  = 2 * time.Minute
 )
 
-// Load reads and validates a task file.
+// Load reads and validates a task file. A relative Files path is resolved
+// against the task file's directory.
 func Load(path string) (*Task, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	return Parse(b)
+	t, err := Parse(b)
+	if err != nil {
+		return nil, err
+	}
+	if t.Files != "" && !filepath.IsAbs(t.Files) {
+		t.Files = filepath.Join(filepath.Dir(path), t.Files)
+	}
+	if t.Files != "" {
+		if abs, err := filepath.Abs(t.Files); err == nil {
+			t.Files = abs
+		}
+	}
+	return t, nil
+}
+
+// Archive returns Files as a gzipped tarball, ready to unpack in the workdir.
+func (t *Task) Archive() ([]byte, error) {
+	if t.Files == "" {
+		return nil, nil
+	}
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	err := filepath.WalkDir(t.Files, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(t.Files, path)
+		if err != nil || rel == "." {
+			return err
+		}
+		if d.Name() == "__pycache__" || d.Name() == ".pytest_cache" || d.Name() == ".git" {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		hdr, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		hdr.Name = filepath.ToSlash(rel)
+		hdr.Uid, hdr.Gid, hdr.Uname, hdr.Gname = 0, 0, "", ""
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if d.Type().IsRegular() {
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			_, err = tw.Write(b)
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("task files: %w", err)
+	}
+	if err := tw.Close(); err != nil {
+		return nil, err
+	}
+	if err := gz.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // Parse validates a task spec and fills in defaults.

@@ -9,6 +9,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -22,6 +23,8 @@ import (
 	"github.com/sanidhyasin/furcate/internal/bisect"
 	"github.com/sanidhyasin/furcate/internal/controller"
 	"github.com/sanidhyasin/furcate/internal/driver"
+	"github.com/sanidhyasin/furcate/internal/driver/docker"
+	"github.com/sanidhyasin/furcate/internal/driver/tine"
 	"github.com/sanidhyasin/furcate/internal/pricing"
 	"github.com/sanidhyasin/furcate/internal/replay"
 	"github.com/sanidhyasin/furcate/internal/runstore"
@@ -32,7 +35,19 @@ import (
 
 // drivers lists the sandbox drivers the CLI can use. The test-only directory
 // driver is deliberately absent: it has no isolation.
-var drivers = map[string]func() (driver.Sandbox, error){}
+var drivers = map[string]func() (driver.Sandbox, error){
+	"docker": func() (driver.Sandbox, error) {
+		return docker.New(docker.Options{Memory: envOr("FURCATE_DOCKER_MEMORY", "2g")})
+	},
+	// FURCATE_TINE_HOST is unix:///run/tine/tine.sock (default) or ssh://<host>;
+	// FURCATE_TINE_SSH is the ssh command, e.g. "ssh -F ../tine/.tine-ssh-config".
+	"tine": func() (driver.Sandbox, error) {
+		vcpus, _ := strconv.Atoi(os.Getenv("FURCATE_TINE_VCPUS"))
+		mem, _ := strconv.Atoi(os.Getenv("FURCATE_TINE_MEMORY_MIB"))
+		return tine.New(tine.Options{Host: os.Getenv("FURCATE_TINE_HOST"), SSH: os.Getenv("FURCATE_TINE_SSH"),
+			VCPUs: vcpus, MemoryMiB: mem, Strategy: os.Getenv("FURCATE_TINE_STRATEGY")})
+	},
+}
 
 func newDriver(name string) (driver.Sandbox, error) {
 	mk, ok := drivers[name]
@@ -43,8 +58,7 @@ func newDriver(name string) (driver.Sandbox, error) {
 		}
 		slices.Sort(names)
 		if len(names) == 0 {
-			return nil, errors.New("no sandbox driver is built in yet: the tine driver lands once tine can " +
-				"restore VMs from saved snapshots (see README, Phase 2)")
+			return nil, errors.New("no sandbox drivers")
 		}
 		return nil, fmt.Errorf("unknown driver %q (have: %s)", name, strings.Join(names, ", "))
 	}
