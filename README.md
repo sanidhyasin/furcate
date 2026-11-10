@@ -1,13 +1,18 @@
 # Furcate
 
 Agent traces you can fork from any step. Every step of an agent run is recorded
-as a span and checkpointed by a sandbox driver, so a failed run can be reopened
-at step k and run again from that exact state (same files, processes and
-conversation) with a different prompt, model or tool output. On top of that:
-**agent bisect** finds the step where a run went wrong, and **eval cases** turn
-checkpoints of real runs into tests that run in CI.
+as a span and checkpointed by a sandbox driver ([tine](https://github.com/sanidhyasin/tine)
+Firecracker VMs, or Docker), so a failed run can be reopened at step k and run
+again from that exact state (same files, processes and conversation) with a
+different prompt, model or tool output. On top of that: **agent bisect** finds
+the step where a run went wrong, and **eval cases** turn checkpoints of real runs
+into tests that run in CI.
 
-Design doc: <https://claude.ai/artifact/QsPmNLTXC9aALQR5ZT1hTK>
+![Furcate's web UI on a failed run: the pass rate of its forks from each step, with 95% intervals, and its trace with a checkpoint and "Fork from here" on every LLM call](docs/web-ui.png)
+
+*The failed `csv-report` run below in the web UI: 410 forks, by step and change. From
+step 5 a quarter pass, from step 7 none, and from step 5 with one added
+sentence of prompt all 20 do.*
 
 ## Status
 
@@ -115,7 +120,8 @@ Hardware and method for each line.
 
 **Real agent runs**, Claude Opus 5.5 (effort high), the `csv-report` example
 ([details](examples/csv-report/README.md)); Docker Desktop on an Apple M5, tine on
-the m8i.xlarge above with diff snapshots and the same Python image. The shipped
+an AWS m8i.xlarge (nested virtualization) with diff snapshots and the same Python
+image. The shipped
 prompt says the repo's test data is often stale; the agent deleted the two bad
 rows from the test fixture instead of fixing the code in 5 of 8 runs on each
 driver.
@@ -141,7 +147,8 @@ further.
 | Claude Code 2.1.322 as a drop-in agent, then forked ([details](examples/claude-code/README.md)) | passed in 4 requests; forks from requests 2 and 3, with a new instruction or Sonnet 5.5, 3/3 each | $0.11 for the run, $0.12-0.16 per fork of 3 |
 
 All the real-model work on 2026-11-10, sweeps and repeated bisects included,
-cost $20.47 (2,351 calls).
+cost $20.47 (2,351 calls); the bare-metal runs in the checkpoint comparison below
+added about $2.
 
 **Trace store**, Apple M5 (10 cores), ClickHouse 25.8 in Docker Desktop (8 GB),
 `furcate loadgen --concurrency 16 --steps 10` for 30 s:
@@ -264,8 +271,25 @@ files, both get the same answer and Docker wins on time.
   and resume. Keeping the waiting process needs tine and an in-sandbox shim.
 - **Refusal fallbacks on by default** (`-no-fallbacks` to turn off); spans record
   which model answered. Default model `claude-opus-5-5`, effort `high`.
-- **Recovery is at-least-once**: a crash replays about a second of flushed records.
-  Trace reads collapse duplicates; rollups don't yet.
+
+## Limits
+
+- **Recovery is at-least-once.** A collector crash replays about a second of
+  flushed records as duplicate rows. Trace reads collapse them; rollups count them.
+- **Docker forks restore files, not processes.** A run whose outcome depends on a
+  running process needs tine (see the case study above).
+- **Drop-in forks are level 2.** They resume the agent from its on-disk transcript
+  rather than its live process, and keep the network to reach the proxy.
+- **`furcate runs` shows a run once its root span arrives**, so runs still in
+  progress don't appear.
+- **Checkpoints expire only through `furcate gc`**; nothing runs it on a schedule.
+- **The fork limit is per process.** Two CLI processes don't share sandbox slots.
+- **`eval export` reads the task's starting files from disk**, so if they changed
+  since the run, the bundle carries the new ones.
+- **The tine driver needs tine's
+  [`furcate-additions`](https://github.com/sanidhyasin/tine/tree/furcate-additions)
+  branch** (retained snapshots, forks of snapshots, offline VMs), which isn't in a
+  tine release yet.
 
 ## Layout
 
@@ -294,9 +318,23 @@ go test -race ./...
 FURCATE_TEST_DOCKER=1 go test ./internal/driver/docker/ ./internal/dropin/
 FURCATE_TEST_PG='postgres://furcate:furcate@localhost:5432/furcate?sslmode=disable' go test ./internal/runstore/
 FURCATE_TEST_E2E=1 go test ./internal/replay/        # with `furcate collector` running
-FURCATE_TEST_TINE=ssh://tine-dev FURCATE_TINE_SSH="ssh -F ../tine/.tine-ssh-config" go test ./internal/driver/tine/
-FURCATE_CASESTUDY=tine ... go test ./internal/casestudy/
+FURCATE_TEST_TINE=ssh://<tine-host> FURCATE_TINE_SSH="ssh -F <ssh-config>" go test ./internal/driver/tine/
+FURCATE_CASESTUDY=docker go test ./internal/casestudy/   # or =tine, with the two variables above
 ```
 
-The tine driver needs tine's `furcate-additions` branch (retained snapshots, forks
-of snapshots, offline VMs).
+When changing the code:
+
+- Bind times to ClickHouse as `UnixNano()` with `fromUnixTimestamp64Nano(?)`: the
+  driver formats a bound `time.Time` to whole seconds. Bound slices become array
+  literals, so use `has(?, col)` rather than `IN ?`.
+- `internal/store/schema.sql` is split on `;` after comment lines are dropped, so
+  keep `;` out of string literals there.
+- Fork changes must stay append-only or touch only the newest message, so replayed
+  thinking blocks stay valid and the prompt cache stays warm.
+- On macOS, a `-race` test that starts many processes at once can hang in the
+  race detector (a child spins in `__tsan::TraceSwitchPartImpl` before exec).
+  Kill it and rerun; it isn't a Furcate bug.
+
+## License
+
+Apache 2.0; see [LICENSE](LICENSE).
