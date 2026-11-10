@@ -22,10 +22,17 @@ sandbox driver, then fork, bisect and build evals from any step. Working name wa
   Before `./scripts/dev-server.sh stop`: delete leftover retained snapshots (they hold
   disk) and remove any systemd override you added. The user wants no idle AWS
   charges. c5d.metal costs $4.75/h: batch work before starting it.
-- Claude API access: as of 2026-11-10 the ANTHROPIC_API_KEY in this environment is
-  rejected (401) and the `ant` profile has no credentials file, so real-model runs
-  are blocked until the user fixes it. Everything else is tested with scripted
-  models.
+- Claude API access: use only the user's Anthropic key, the one tine uses. It is
+  `ANTHROPIC_API_KEY` here (loaded from the keychain item `anthropic-api-key`) and
+  the same key as `~/.config/tine/anthropic-api-key`. A 401 seen earlier on
+  2026-11-10 didn't recur. Never print it, and ask before storing it anywhere else
+  (e.g. as a GitHub secret). Put a `-max-usd` cap on experiments and report spend.
+- Docker Desktop's 58 GB disk is ~98% full, mostly the user's build cache and
+  other projects' images: never prune those. Postgres "No space left on device"
+  means this. Free space with `furcate gc -driver docker <run-id>...` for runs that
+  won't be forked again. An original run's Docker checkpoint copies everything
+  changed since the template (~23 MB for csv-report's pip install), so install
+  dependencies in the template, as examples/claude-code/Dockerfile does.
 - Goal: a portfolio project for agent-infrastructure roles. Published numbers
   matter as much as features. Every number needs its hardware, data size and method.
 
@@ -63,3 +70,7 @@ sandbox driver, then fork, bisect and build evals from any step. Working name wa
 - The fork scheduler is per process; two CLI processes don't share slots.
 - Drop-in is level 2 only (a fork resumes the agent from its on-disk transcript);
   forks keep the network to reach the proxy.
+- Eval export reads the task's starting files from disk (`task.files`); if they
+  changed since the run, the bundle's setup sees the new ones.
+- The Phase 4 PR comment hasn't run on GitHub: the repo has no ANTHROPIC_API_KEY
+  secret yet, and adding one is the user's call.

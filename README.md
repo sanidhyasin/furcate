@@ -11,17 +11,17 @@ Design doc: <https://claude.ai/artifact/QsPmNLTXC9aALQR5ZT1hTK>
 
 ## Status
 
-All five phases are built and tested. The gates that need only sandboxes are met;
-the ones that need a real model are waiting on Claude API credentials (the key in
-the build environment is rejected).
+All five phases are built and tested, and every gate has been met with Claude
+Opus 5.5 on Docker. The real-model bisect on tine and the c5d.metal numbers are
+still to do.
 
 | Phase | Built | Gate | State |
 | --- | --- | --- | --- |
 | 1 | OTLP collector with a write-ahead log, ClickHouse trace store, payload table, CLI, load generator | ingest and query numbers published | laptop numbers below; c5d.metal pending |
 | 2 | driver interface; tine and Docker drivers; run controller; `furcate fork` | a fork of step k matches its files and conversation; step overhead measured | **met on tine** |
-| 3 | bisect, branch compare, fork scheduler, checkpoint gc | bisect finds the faulty step of a real failure on tine and Docker | met with a scripted agent; real-model failure pending |
-| 4 | eval cases, portable bundles, `furcate eval run`, GitHub Action | a prompt change in a real repo shows its pass-rate change on the PR | built; needs a key and the repo secret |
-| 5 | drop-in mode for unmodified agents, web UI with "fork from here" | an unmodified Claude Code run forked from any LLM call | drop-in tested with a transcript-keeping agent; UI built; Claude Code run pending |
+| 3 | bisect, branch compare, fork scheduler, checkpoint gc | bisect finds the faulty step of a real failure on tine and Docker | **met on Docker** with a real Opus 5.5 failure; on tine with a scripted agent |
+| 4 | eval cases, portable bundles, `furcate eval run`, GitHub Action | a prompt change in a real repo shows its pass-rate change on the PR | **met locally** (7/30 to 30/30); the PR comment needs the key as a repo secret |
+| 5 | drop-in mode for unmodified agents, web UI with "fork from here" | an unmodified Claude Code run forked from any LLM call | **met**: Claude Code 2.1.322 forked from requests 2 and 3 |
 
 ## Quick start
 
@@ -43,8 +43,9 @@ Then, with `ANTHROPIC_API_KEY` set:
 ./bin/furcate eval add -run <run-id> -step 5 -name fixture-edit-01
 ./bin/furcate eval export fixture-edit-01
 ./bin/furcate eval run -variant name=main -variant name=careful,system-file=examples/csv-report/task-careful.json
+docker build -t furcate-example/claude-code:2.1.322 examples/claude-code
 ./bin/furcate dropin run -task examples/claude-code/task.json -driver docker
-./bin/furcate gc -driver docker -older-than 24h
+./bin/furcate gc -driver docker -older-than 24h   # or: gc <run-id>... for runs you won't fork
 ./bin/furcate serve -driver docker           # web UI on http://127.0.0.1:7070
 ```
 
@@ -106,6 +107,21 @@ Any OpenTelemetry SDK can also send plain traces to `http://localhost:4318/v1/tr
 
 Hardware and method for each line; nothing here is from the c5d.metal yet.
 
+**Real agent runs**, Claude Opus 5.5 (effort high), Docker Desktop on an Apple M5,
+the `csv-report` example ([details](examples/csv-report/README.md)). The shipped
+prompt says the repo's test data is often stale; in 5 of 8 runs the agent
+deleted the two bad rows from the test fixture instead of fixing the code.
+
+| Experiment | Result | Cost |
+| --- | --- | --- |
+| `furcate bisect -n 10` of one failing run | "the decision at step 5 breaks the run": step 5 4/20, step 7 0/20 (low confidence: intervals touched) | 70 continuations, $1.52, 1m43s |
+| 20 more forks at step 5, 10 more at step 7 | step 5 11/40 (0.16-0.43), step 7 0/30 (0.00-0.11): separated | $0.57 |
+| fork step 5 with "Never modify tests or test fixtures..." appended | 20/20 (0.84-1.00) | $0.50 |
+| `furcate eval run`: 3 cases from the failing runs, shipped vs careful prompt, n=10 | 7/30 vs 30/30: +77 points (95% CI +56 to +88) | 60 continuations, $1.60, 1m39s |
+| Claude Code 2.1.322 as a drop-in agent, then forked ([details](examples/claude-code/README.md)) | passed in 4 requests; forks from requests 2 and 3, with a new instruction or Sonnet 5.5, 3/3 each | $0.11 for the run, $0.12-0.16 per fork of 3 |
+
+All the real-model work on 2026-11-10, sweeps included, cost $5.96 (727 calls).
+
 **Trace store**, Apple M5 (10 cores), ClickHouse 25.8 in Docker Desktop (8 GB),
 `furcate loadgen --concurrency 16 --steps 10` for 30 s:
 
@@ -146,6 +162,15 @@ files, both get the same answer and Docker wins on time.
 
 ## Decisions taken while building
 
+- **The example fails because of its prompt, not a planted bug.** With hints in
+  the tests (a descriptive name, a comment) Opus 5.5 fixed the code in all 50
+  runs across prompts and models; the shipped example is the version that fails
+  for a reason teams actually write into prompts.
+- **Schema changes take a Postgres advisory lock.** Ten `furcate` processes
+  started together deadlocked on each other's `ALTER TABLE`s.
+- **A bundle carries the task's starting files.** Setup reruns on them, so
+  whatever it records outside the workdir (the check's fixture hashes) matches
+  the original run; then the checkpoint's workdir is swapped in.
 - **Payloads live in a ClickHouse table.** One file per payload ran at 382 spans/s
   with 87% of CPU in file-system syscalls; the table is 25x faster.
 - **Conversations are raw JSON, never re-encoded.** Decoding a recorded request
