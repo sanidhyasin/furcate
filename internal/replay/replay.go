@@ -196,6 +196,28 @@ type Spec struct {
 	Branch       controller.Branch // parent, step, change, eval tags; copied to every branch
 }
 
+// ForkRetry forks k sandboxes from cp and asks once more for any the driver
+// couldn't start: one VM that fails to boot under load shouldn't sink a bisect.
+// It returns the sandboxes it got, with an error when that's fewer than k.
+func ForkRetry(ctx context.Context, sb driver.Sandbox, cp driver.CheckpointID, k int, offline bool) ([]driver.Instance, error) {
+	insts, err := sb.Fork(ctx, cp, k, offline)
+	if len(insts) >= k {
+		return insts, nil
+	}
+	more, err2 := sb.Fork(ctx, cp, k-len(insts), offline)
+	insts = append(insts, more...)
+	if len(insts) >= k {
+		return insts, nil
+	}
+	if err2 == nil {
+		err2 = err
+	}
+	if err2 == nil {
+		err2 = fmt.Errorf("the driver started %d of %d sandboxes", len(insts), k)
+	}
+	return insts, err2
+}
+
 // Run forks spec.Checkpoint into N sandboxes and runs the continuations,
 // admitting branches as sandbox slots free up, a chunk at a time, each chunk
 // forked in one driver call.
@@ -210,11 +232,8 @@ func (e *Engine) Run(ctx context.Context, spec Spec) (*Result, error) {
 			wg.Wait()
 			return nil, err
 		}
-		insts, err := sb.Fork(ctx, spec.Checkpoint, k, offline)
-		if err != nil {
-			for _, inst := range insts {
-				sb.Destroy(context.WithoutCancel(ctx), inst)
-			}
+		insts, err := ForkRetry(ctx, sb, spec.Checkpoint, k, offline)
+		if len(insts) == 0 {
 			release(k)
 			if next == 0 {
 				return nil, fmt.Errorf("fork checkpoint: %w", err)
@@ -224,6 +243,10 @@ func (e *Engine) Run(ctx context.Context, spec Spec) (*Result, error) {
 				res.Branches[i] = controller.Result{Status: runstore.StatusError, Err: fmt.Errorf("fork checkpoint: %w", err)}
 			}
 			break
+		}
+		if err != nil && e.Controller.Log != nil {
+			// Run the ones that started; the rest are forked in a later chunk.
+			e.Controller.Log.Warn("some forks failed", "asked", k, "started", len(insts), "err", err)
 		}
 		release(k - len(insts))
 		for _, inst := range insts {

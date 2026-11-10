@@ -28,7 +28,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -436,14 +435,7 @@ func runCell(ctx context.Context, eng *replay.Engine, b *Bundle, r *Restored, v 
 // Difference is variant b's pass rate minus variant a's, with Newcombe's 95%
 // interval (built from the two Wilson intervals). Cases are pooled.
 func Difference(a, b *Cell) (d, lo, hi float64) {
-	if a.Done == 0 || b.Done == 0 {
-		return 0, -1, 1
-	}
-	pa, pb := float64(a.Passes)/float64(a.Done), float64(b.Passes)/float64(b.Done)
-	d = pb - pa
-	lo = d - math.Sqrt(math.Pow(pb-b.Lo, 2)+math.Pow(a.Hi-pa, 2))
-	hi = d + math.Sqrt(math.Pow(b.Hi-pb, 2)+math.Pow(pa-a.Lo, 2))
-	return d, lo, hi
+	return stats.Newcombe(b.Passes, b.Done, a.Passes, a.Done, stats.Z95)
 }
 
 // Verdict reads a difference interval.

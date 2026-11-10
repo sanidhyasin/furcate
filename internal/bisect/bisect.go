@@ -63,8 +63,30 @@ func (p *Probe) add(r *replay.Result) {
 	}
 }
 
-// above reports that a's interval lies wholly above b's.
-func above(a, b *Probe) bool { return a.Lo > b.Hi }
+// extraRounds is how many more rounds of N a probe gets when it hasn't
+// separated from its neighbours, budget allowing. A 30% pass rate against 0%
+// takes about 30 continuations a side to show at 95%, more than N=10 or 20.
+const extraRounds = 3
+
+// resampleSteps is what to probe again when mid is ambiguous: mid itself, and
+// either neighbour that has had no more continuations than mid, since a
+// well-sampled probe can't separate from one that has had a single round.
+func resampleSteps(mid, good, bad *Probe) []int {
+	steps := []int{mid.Step}
+	for _, q := range []*Probe{good, bad} {
+		if q.Done <= mid.Done {
+			steps = append(steps, q.Step)
+		}
+	}
+	return steps
+}
+
+// above reports that a's pass rate is higher than b's: the 95% interval of the
+// difference lies above zero.
+func above(a, b *Probe) bool {
+	_, lo, _ := stats.Newcombe(a.Passes, a.Done, b.Passes, b.Done, stats.Z95)
+	return lo > 0
+}
 
 // Result is what bisect found and what it cost.
 type Result struct {
@@ -154,11 +176,16 @@ func Run(ctx context.Context, eng *replay.Engine, cfg Config) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !above(good, bad) { // one more round on both ends before giving up
-		if _, err := probe(first, cfg.N); err == nil {
+	// More rounds on both ends until they separate, before giving up.
+	for i := 0; i < extraRounds && !above(good, bad); i++ {
+		_, err := probe(first, cfg.N)
+		if err == nil {
 			_, err = probe(last, cfg.N)
 		}
-		if err != nil && !errors.Is(err, errBudget) {
+		if errors.Is(err, errBudget) {
+			break
+		}
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -190,13 +217,20 @@ func Run(ctx context.Context, eng *replay.Engine, cfg Config) (*Result, error) {
 			return nil, err
 		}
 		isGood, isBad := above(p, bad), above(good, p)
-		if isGood == isBad { // ambiguous: sample more before deciding
-			if _, err := probe(res.Steps[mid], cfg.N); err != nil && !errors.Is(err, errBudget) {
-				return nil, err
+	resample:
+		for i := 0; i < extraRounds && !isGood && !isBad; i++ { // ambiguous: sample more
+			for _, step := range resampleSteps(p, good, bad) {
+				_, err := probe(step, cfg.N)
+				if errors.Is(err, errBudget) {
+					break resample
+				}
+				if err != nil {
+					return nil, err
+				}
 			}
 			isGood, isBad = above(p, bad), above(good, p)
 		}
-		if isGood == isBad { // still ambiguous: go by the point estimate
+		if isGood == isBad { // still ambiguous, or between the two: go by the point estimate
 			res.Confident = false
 			isGood = p.Rate() >= (good.Rate()+bad.Rate())/2
 		}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -26,9 +27,10 @@ import (
 // fixture on every fifth call: from any step before that decision, about 80% of
 // continuations pass; after it, none do. The original run is made to fail.
 type flakyModel struct {
-	ids      atomic.Int64
-	decision atomic.Int64
-	scripted string // "" or "always-rm" / "never-rm"
+	ids        atomic.Int64
+	decision   atomic.Int64
+	scripted   string // "" or "always-rm" / "never-rm"
+	passTenths int64  // if set, keep the fixture on this many calls in ten
 }
 
 func (m *flakyModel) Send(_ context.Context, body []byte) (*anthropic.Message, error) {
@@ -49,7 +51,11 @@ func (m *flakyModel) Send(_ context.Context, body []byte) (*anthropic.Message, e
 	case 1:
 		content = m.tool("write_file", `{"path":"notes.md","content":"plan"}`)
 	case 2:
-		rm := m.decision.Add(1)%5 == 0
+		d := m.decision.Add(1)
+		rm := d%5 == 0
+		if m.passTenths > 0 {
+			rm = d%10 >= m.passTenths
+		}
 		switch m.scripted {
 		case "always-rm":
 			rm = true
@@ -133,6 +139,38 @@ func TestBisectFindsTheDecision(t *testing.T) {
 	// First, last, then two midpoints: 4 probes, 40 continuations.
 	if len(res.Probes) != 4 || res.Runs != 40 || res.Usage.CostUSD <= 0 {
 		t.Fatalf("probes %d, runs %d, cost %.4f", len(res.Probes), res.Runs, res.Usage.CostUSD)
+	}
+}
+
+// The real csv-report failure: about 30% of continuations pass from before the
+// decision, none after. At N=10 the ends need a second round to separate, and
+// the two Wilson intervals still touch (0.15-0.52 against 0.00-0.16).
+func TestBisectFindsTheDecisionAtALowPassRate(t *testing.T) {
+	eng, run := setup(t, &flakyModel{passTenths: 3})
+	res, err := Run(context.Background(), eng, Config{RunID: run, N: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Faulty != 5 || res.FirstBad.Step != 7 {
+		t.Fatalf("faulty step %d: %s", res.Faulty, res.Verdict)
+	}
+	if res.Runs > 100 {
+		t.Fatalf("%d runs: over the default budget", res.Runs)
+	}
+}
+
+// The real Docker bisect: step 5 had 40 continuations and step 7 only 10, and
+// 9/40 against 0/10 never separates however many more step 5 gets.
+func TestResampleTopsUpTheThinnerNeighbour(t *testing.T) {
+	good := &Probe{Step: 3, Done: 30}
+	mid := &Probe{Step: 5, Done: 10}
+	bad := &Probe{Step: 7, Done: 10}
+	if got := resampleSteps(mid, good, bad); !slices.Equal(got, []int{5, 7}) {
+		t.Fatalf("resample %v, want [5 7]", got)
+	}
+	mid.Done, bad.Done = 20, 30
+	if got := resampleSteps(mid, good, bad); !slices.Equal(got, []int{5}) {
+		t.Fatalf("resample %v, want [5]", got)
 	}
 }
 

@@ -309,6 +309,37 @@ func TestSlotsBoundConcurrentBranches(t *testing.T) {
 	}
 }
 
+// flakyDriver's first fork starts one sandbox fewer than asked, with an error,
+// as tine does when a VM never becomes healthy.
+type flakyDriver struct {
+	*testdir.Driver
+	forks atomic.Int32
+}
+
+func (d *flakyDriver) Fork(ctx context.Context, cp driver.CheckpointID, n int, offline bool) ([]driver.Instance, error) {
+	insts, err := d.Driver.Fork(ctx, cp, n, offline)
+	if d.forks.Add(1) == 1 && err == nil && len(insts) > 0 {
+		d.Driver.Destroy(ctx, insts[0])
+		return insts[1:], fmt.Errorf("1 of %d failed: agent never became healthy", n)
+	}
+	return insts, err
+}
+
+func TestForkRetriesSandboxesThatFailToStart(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	orig := h.ctl.Start(ctx, h.task)
+	fd := &flakyDriver{Driver: h.drv}
+	h.ctl.Driver = fd
+	res, err := h.engine.Fork(ctx, Request{RunID: orig.RunID, Step: 5, N: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Done != 4 || len(res.Branches) != 4 || fd.forks.Load() != 2 {
+		t.Fatalf("done %d of %d after %d fork calls: want 4 of 4 and a retry", res.Done, len(res.Branches), fd.forks.Load())
+	}
+}
+
 func TestForkRejectsToolSteps(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()

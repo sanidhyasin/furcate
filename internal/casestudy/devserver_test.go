@@ -112,6 +112,14 @@ func TestDevServerBisect(t *testing.T) {
 	rec := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
 	store := runstore.NewMemory()
+	// The store is in memory, so furcate gc can never find these checkpoints, and
+	// tine keeps each one as a retained snapshot (1.3 GiB) until it's deleted.
+	defer func() {
+		cps, _ := store.Expirable(ctx, time.Now().Add(time.Hour))
+		for _, c := range cps {
+			sb.DeleteCheckpoint(ctx, driver.CheckpointID(c.DriverRef))
+		}
+	}()
 	agent := &devServerAgent{}
 	ctl := &controller.Controller{Driver: sb, Model: agent, Store: store, Tracer: tp.Tracer("case"),
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Slots: controller.NewSlots(10)}

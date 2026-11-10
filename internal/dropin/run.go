@@ -104,11 +104,8 @@ func (e *Engine) Fork(ctx context.Context, req replay.Request) (*replay.Result, 
 			wg.Wait()
 			return nil, err
 		}
-		insts, err := e.Driver.Fork(ctx, driver.CheckpointID(cp.DriverRef), k, false)
-		if err != nil {
-			for _, inst := range insts {
-				e.destroy(inst)
-			}
+		insts, err := replay.ForkRetry(ctx, e.Driver, driver.CheckpointID(cp.DriverRef), k, false)
+		if len(insts) == 0 {
 			release(k)
 			if next == 0 {
 				return nil, fmt.Errorf("fork checkpoint: %w", err)
@@ -117,6 +114,9 @@ func (e *Engine) Fork(ctx context.Context, req replay.Request) (*replay.Result, 
 				res.Branches[i] = controller.Result{Status: runstore.StatusError, Err: err}
 			}
 			break
+		}
+		if err != nil && e.Log != nil {
+			e.Log.Warn("some forks failed", "asked", k, "started", len(insts), "err", err)
 		}
 		release(k - len(insts))
 		for _, inst := range insts {
