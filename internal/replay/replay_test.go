@@ -355,3 +355,14 @@ func TestWilsonMatchesTheDesignDoc(t *testing.T) {
 		t.Fatalf("8/10 and 0/10 should separate: %.2f vs %.2f", lo10, hi10)
 	}
 }
+
+func TestAgreement(t *testing.T) {
+	for _, c := range []struct {
+		k, n int
+		want float64
+	}{{10, 10, 1}, {0, 10, 1}, {5, 10, 40.0 / 90}, {8, 10, (56.0 + 2) / 90}} {
+		if got := stats.Agreement(c.k, c.n); math.Abs(got-c.want) > 1e-9 {
+			t.Errorf("Agreement(%d, %d) = %.4f, want %.4f", c.k, c.n, got, c.want)
+		}
+	}
+}

@@ -25,3 +25,14 @@ func Wilson(k, n int, z float64) (lo, hi float64) {
 
 // Overlap reports whether two intervals overlap; bisect needs them apart.
 func Overlap(lo1, hi1, lo2, hi2 float64) bool { return lo1 <= hi2 && lo2 <= hi1 }
+
+// Agreement is the chance that two different continuations from the same
+// checkpoint and prompt reach the same outcome, from k passes out of n: the
+// share of agreeing pairs. 1 means the outcome is decided; 0.5 is a coin flip.
+func Agreement(k, n int) float64 {
+	if n < 2 {
+		return 1
+	}
+	pairs := float64(n * (n - 1))
+	return (float64(k*(k-1)) + float64((n-k)*(n-k-1))) / pairs
+}

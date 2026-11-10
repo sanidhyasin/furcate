@@ -14,10 +14,18 @@ sandbox driver, then fork, bisect and build evals from any step. Working name wa
   dial-stdio`); its Go client is under internal/ so Furcate needs its own. The tine
   driver needs three tine additions first: VMs from a saved snapshot, snapshots
   that outlive their VM (and more than 16 per VM), and offline VMs.
-- Linux testing uses tine's AWS dev server, as tine does: `../tine/scripts/dev-server.sh`
-  (up / status / ssh / stop; m8i.xlarge with nested virt, ap-south-1, ~$0.23/h,
-  auto-stops after 60 idle min). Stop it when done. Don't start c5d.metal
-  ($4.75/h) without asking.
+- Linux testing uses tine's AWS dev server, as tine does: from ../tine,
+  `./scripts/dev-server.sh up`, `make deploy` (installs tined from the checked-out
+  branch; tine's `furcate-additions` branch has the retained-snapshot, snapshot-fork
+  and offline-VM API), `./scripts/dev-server.sh ssh-config > .tine-ssh-config`, then
+  from here `FURCATE_TEST_TINE=ssh://tine-dev FURCATE_TINE_SSH="ssh -F ../tine/.tine-ssh-config"`.
+  Before `./scripts/dev-server.sh stop`: delete leftover retained snapshots (they hold
+  disk) and remove any systemd override you added. The user wants no idle AWS
+  charges. c5d.metal costs $4.75/h: batch work before starting it.
+- Claude API access: as of 2026-11-10 the ANTHROPIC_API_KEY in this environment is
+  rejected (401) and the `ant` profile has no credentials file, so real-model runs
+  are blocked until the user fixes it. Everything else is tested with scripted
+  models.
 - Goal: a portfolio project for agent-infrastructure roles. Published numbers
   matter as much as features. Every number needs its hardware, data size and method.
 
@@ -38,7 +46,11 @@ sandbox driver, then fork, bisect and build evals from any step. Working name wa
 - Fork changes must stay append-only or touch only the newest message (preserved
   thinking's history-editing check; prompt caching).
 - Integration tests: `FURCATE_TEST_PG=<dsn>` for Postgres, `FURCATE_TEST_E2E=1`
-  with `furcate collector` running for the full chain.
+  with `furcate collector` running for the full chain, `FURCATE_TEST_DOCKER=1` for
+  the Docker driver and drop-in, `FURCATE_TEST_TINE=ssh://tine-dev` for the tine gate,
+  `FURCATE_CASESTUDY=docker|tine` for the side-by-side bisect.
+- Drop-in proxies listen on 127.0.0.1 and sandboxes reach them as
+  host.docker.internal (Docker Desktop). Never bind 0.0.0.0.
 
 ## Known gaps
 
@@ -46,9 +58,8 @@ sandbox driver, then fork, bisect and build evals from any step. Working name wa
   duplicate rows. Trace reads dedupe by span_id; rollups don't.
 - The trace_index only beats a full scan on large tables; not yet measured at scale.
 - `runs` lists a run only once its root span arrives, so in-progress runs are hidden.
-- No real sandbox driver yet; the CLI's `run` and `fork` refuse until the tine
-  driver exists. `testdir` is test-only (no isolation) and must stay out of the CLI.
-- Checkpoints are never expired or deleted yet; branches run with no concurrency
-  limit (the fork scheduler is Phase 3).
-- `gen_ai.usage.input_tokens` on agent spans includes cache reads, so a price
-  table overprices cached input.
+- `testdir` is test-only (no isolation) and must stay out of the CLI.
+- Checkpoints expire only through `furcate gc`; nothing runs it on a schedule.
+- The fork scheduler is per process; two CLI processes don't share slots.
+- Drop-in is level 2 only (a fork resumes the agent from its on-disk transcript);
+  forks keep the network to reach the proxy.

@@ -304,7 +304,7 @@ func runBranches(ctx context.Context, args []string) error {
 		return keys[i].change < keys[j].change
 	})
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "STEP\tCHANGE\tPASSED\tRATE\t95% CI\tERRORS")
+	fmt.Fprintln(tw, "STEP\tCHANGE\tPASSED\tRATE\t95% CI\tAGREE\tERRORS")
 	for _, k := range keys {
 		g := groups[k]
 		lo, hi := stats.Wilson(g.pass, g.done, stats.Z95)
@@ -312,7 +312,8 @@ func runBranches(ctx context.Context, args []string) error {
 		if g.done > 0 {
 			rate = float64(g.pass) / float64(g.done)
 		}
-		fmt.Fprintf(tw, "%d\t%s\t%d/%d\t%.0f%%\t%.2f-%.2f\t%d\n", k.step, k.change, g.pass, g.done, rate*100, lo, hi, g.errs)
+		fmt.Fprintf(tw, "%d\t%s\t%d/%d\t%.0f%%\t%.2f-%.2f\t%.2f\t%d\n", k.step, k.change, g.pass, g.done, rate*100, lo, hi,
+			stats.Agreement(g.pass, g.done), g.errs)
 	}
 	return tw.Flush()
 }
