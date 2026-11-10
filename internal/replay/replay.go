@@ -158,6 +158,10 @@ func (e *Engine) Fork(ctx context.Context, req Request) (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("checkpoint %s: %w", step.CheckpointID, err)
 	}
+	if cp.Deleted {
+		return nil, fmt.Errorf("step %d's checkpoint %s was garbage-collected; pin checkpoints you'll fork later with furcate eval add",
+			req.Step, step.CheckpointID)
+	}
 	body, err := e.request(ctx, req.RunID, step.SpanID)
 	if err != nil {
 		return nil, fmt.Errorf("conversation at step %d: %w", req.Step, err)

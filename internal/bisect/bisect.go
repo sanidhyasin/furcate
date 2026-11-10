@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/sanidhyasin/furcate/internal/driver"
 	"github.com/sanidhyasin/furcate/internal/replay"
 	"github.com/sanidhyasin/furcate/internal/runstore"
 	"github.com/sanidhyasin/furcate/internal/stats"
@@ -164,8 +165,13 @@ func Run(ctx context.Context, eng *replay.Engine, cfg Config) (*Result, error) {
 	if !above(good, bad) {
 		res.Confident = false
 		if good.Hi < 0.5 {
-			return finish(fmt.Sprintf("continuations fail even from step %d (%d/%d pass): the task or prompt is the problem, not one step",
-				first, good.Passes, good.Done))
+			v := fmt.Sprintf("continuations fail even from step %d (%d/%d pass): the task or prompt is the problem, not one step",
+				first, good.Passes, good.Done)
+			if run.Status == runstore.StatusDone && eng.Controller.Driver.Caps().Level < driver.LevelMachine {
+				v += fmt.Sprintf("; or the task needs running processes, which the %s driver doesn't restore in forks (it saves %s only)",
+					eng.Controller.Driver.Caps().Name, eng.Controller.Driver.Caps().Level)
+			}
+			return finish(v)
 		}
 		return finish(fmt.Sprintf("no clear drop: from step %d %d/%d pass, from step %d %d/%d; the outcome looks random rather than decided by one step",
 			first, good.Passes, good.Done, last, bad.Passes, bad.Done))

@@ -43,6 +43,7 @@ Usage:
   furcate bisect <run-id>          find the step where a run went wrong
   furcate compare <run-a> <run-b>  outcome, cost and final files of two runs
   furcate eval ...                 checkpoints as test cases: add, list, export, run
+  furcate gc [-older-than 24h]     delete unpinned checkpoints from the driver
 
 Run "furcate <command> -h" for a command's flags.
 `
@@ -88,6 +89,8 @@ func main() {
 		err = runCompare(ctx, args)
 	case "eval":
 		err = runEval(ctx, args)
+	case "gc":
+		err = runGC(ctx, args)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:

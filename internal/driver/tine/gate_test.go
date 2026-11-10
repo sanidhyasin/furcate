@@ -182,8 +182,9 @@ func checkFork(t *testing.T, ctx context.Context, d *tine.Driver, inst driver.In
 	if a <= 1 || b <= a {
 		t.Fatalf("processes: counter went %d -> %d; want it running on from its value at the checkpoint", a, b)
 	}
-	if ifs := run("ls /sys/class/net"); ifs != "lo" {
-		t.Fatalf("offline fork has interfaces %q", ifs)
+	// Offline: tine's own check, a connection to the internet fails at once.
+	if out := run("timeout 5 bash -c 'echo > /dev/tcp/1.1.1.1/443' 2>&1; true"); !strings.Contains(out, "unreachable") {
+		t.Fatalf("offline fork reached out, or failed oddly: %q", out)
 	}
-	t.Logf("fork fidelity: notes.md restored; counter resumed at %d and reached %d; interfaces: lo only", a, b)
+	t.Logf("fork fidelity: notes.md restored; counter resumed at %d and reached %d; internet: network unreachable", a, b)
 }

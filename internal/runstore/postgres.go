@@ -170,9 +170,9 @@ func (p *Postgres) Checkpoint(ctx context.Context, id string) (Checkpoint, error
 	var size *int64
 	var expires *time.Time
 	err := p.pool.QueryRow(ctx, `
-		SELECT run_id, step, driver, level, driver_ref, size_bytes, pinned, expires_at, created_at
+		SELECT run_id, step, driver, level, driver_ref, size_bytes, pinned, expires_at, created_at, deleted_at IS NOT NULL
 		FROM checkpoints WHERE checkpoint_id = $1`, id).
-		Scan(&c.RunID, &c.Step, &c.Driver, &c.Level, &c.DriverRef, &size, &c.Pinned, &expires, &c.CreatedAt)
+		Scan(&c.RunID, &c.Step, &c.Driver, &c.Level, &c.DriverRef, &size, &c.Pinned, &expires, &c.CreatedAt, &c.Deleted)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Checkpoint{}, ErrNotFound
 	}
@@ -254,4 +254,31 @@ func (p *Postgres) EvalCases(ctx context.Context) ([]EvalCase, error) {
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+func (p *Postgres) Expirable(ctx context.Context, cutoff time.Time) ([]Checkpoint, error) {
+	rows, err := p.pool.Query(ctx, `
+		SELECT checkpoint_id, run_id, step, driver, level, driver_ref, created_at FROM checkpoints
+		WHERE NOT pinned AND deleted_at IS NULL AND created_at < $1 ORDER BY created_at`, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Checkpoint
+	for rows.Next() {
+		var c Checkpoint
+		if err := rows.Scan(&c.CheckpointID, &c.RunID, &c.Step, &c.Driver, &c.Level, &c.DriverRef, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) MarkDeleted(ctx context.Context, id string) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE checkpoints SET deleted_at = now() WHERE checkpoint_id = $1`, id)
+	if err == nil && tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return err
 }

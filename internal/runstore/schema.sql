@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+ALTER TABLE checkpoints ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
 CREATE TABLE IF NOT EXISTS steps (
     run_id        TEXT NOT NULL REFERENCES runs (run_id),
     step_index    INT NOT NULL,

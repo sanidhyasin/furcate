@@ -118,6 +118,7 @@ type Checkpoint struct {
 	Pinned       bool // an eval case uses it; never expires
 	ExpiresAt    time.Time
 	CreatedAt    time.Time
+	Deleted      bool // the driver no longer has it
 }
 
 // ErrNotFound is returned for an unknown run, step or checkpoint.
@@ -138,6 +139,10 @@ type Store interface {
 
 	// PinCheckpoint marks a checkpoint as used by an eval case: never expired.
 	PinCheckpoint(ctx context.Context, checkpointID string) error
+	// Expirable lists live checkpoints, not pinned, created before cutoff.
+	Expirable(ctx context.Context, cutoff time.Time) ([]Checkpoint, error)
+	// MarkDeleted records that the driver deleted a checkpoint.
+	MarkDeleted(ctx context.Context, checkpointID string) error
 	AddEvalCase(ctx context.Context, c EvalCase) error
 	EvalCase(ctx context.Context, caseID string) (EvalCase, error)
 	EvalCases(ctx context.Context) ([]EvalCase, error)
@@ -165,6 +170,31 @@ func (m *Memory) PinCheckpoint(_ context.Context, id string) error {
 		return ErrNotFound
 	}
 	c.Pinned = true
+	m.cps[id] = c
+	return nil
+}
+
+func (m *Memory) Expirable(_ context.Context, cutoff time.Time) ([]Checkpoint, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Checkpoint
+	for _, c := range m.cps {
+		if !c.Pinned && !c.Deleted && c.CreatedAt.Before(cutoff) {
+			out = append(out, c)
+		}
+	}
+	slices.SortFunc(out, func(a, b Checkpoint) int { return a.CreatedAt.Compare(b.CreatedAt) })
+	return out, nil
+}
+
+func (m *Memory) MarkDeleted(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.cps[id]
+	if !ok {
+		return ErrNotFound
+	}
+	c.Deleted = true
 	m.cps[id] = c
 	return nil
 }

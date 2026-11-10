@@ -484,3 +484,48 @@ func short(id string) string {
 	}
 	return id
 }
+
+func runGC(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("gc", flag.ExitOnError)
+	pgDSN := pgFlag(fs)
+	drv := fs.String("driver", envOr("FURCATE_DRIVER", "tine"), "the driver whose checkpoints to delete")
+	olderThan := fs.Duration("older-than", 24*time.Hour, "delete unpinned checkpoints older than this")
+	dry := fs.Bool("dry-run", false, "list what would be deleted")
+	fs.Parse(args)
+	pg, err := runstore.OpenPostgres(ctx, *pgDSN)
+	if err != nil {
+		return err
+	}
+	defer pg.Close()
+	cps, err := pg.Expirable(ctx, time.Now().Add(-*olderThan))
+	if err != nil {
+		return err
+	}
+	var mine []runstore.Checkpoint
+	for _, c := range cps {
+		if c.Driver == *drv {
+			mine = append(mine, c)
+		}
+	}
+	if *dry || len(mine) == 0 {
+		fmt.Printf("%d unpinned %s checkpoints older than %s\n", len(mine), *drv, *olderThan)
+		return nil
+	}
+	sb, err := newDriver(*drv)
+	if err != nil {
+		return err
+	}
+	deleted, kept := 0, 0
+	for _, c := range mine {
+		if err := sb.DeleteCheckpoint(ctx, driver.CheckpointID(c.DriverRef)); err != nil {
+			kept++ // in use by a running sandbox, or the driver is unreachable: next time
+			continue
+		}
+		if err := pg.MarkDeleted(ctx, c.CheckpointID); err != nil {
+			return err
+		}
+		deleted++
+	}
+	fmt.Printf("deleted %d %s checkpoints; %d still in use, kept for next time\n", deleted, *drv, kept)
+	return nil
+}
