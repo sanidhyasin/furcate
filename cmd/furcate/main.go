@@ -43,7 +43,7 @@ Usage:
   furcate bisect <run-id>          find the step where a run went wrong
   furcate compare <run-a> <run-b>  outcome, cost and final files of two runs
   furcate eval ...                 checkpoints as test cases: add, list, export, run
-  furcate gc [-older-than 24h]     delete unpinned checkpoints from the driver
+  furcate gc [run-id...]           delete unpinned checkpoints: old ones, or these runs
   furcate dropin run|fork ...      record and fork an unmodified agent (Claude Code)
   furcate serve [-driver docker]   web UI and HTTP API on 127.0.0.1:7070
 

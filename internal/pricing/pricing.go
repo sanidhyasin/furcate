@@ -4,7 +4,7 @@
 // uses that instead.
 //
 //	{"claude-sonnet-5-5": {"input_per_mtok": 2.0, "output_per_mtok": 10.0,
-//	                       "cache_read_per_mtok": 0.2, "cache_write_per_mtok": 2.5}}
+//	                       "cache_read_per_mtok": 0.1, "cache_write_per_mtok": 2.5}}
 package pricing
 
 import (
@@ -25,14 +25,15 @@ type Price struct {
 type Table map[string]Price
 
 // Defaults are Anthropic's first-party rates for the current Claude models, as
-// published on 2026-10-06. Cache reads and 5-minute writes for Haiku 5.5 assume
-// the usual 0.1x and 1.25x of input. Check current prices before publishing a
+// listed on 2026-11-03. 5-minute cache writes are 1.25x input; cache reads for
+// Haiku 5.5 assume the usual 0.1x. Check current prices before publishing a
 // dollar figure.
 func Defaults() Table {
 	return Table{
+		"claude-fable-5-2":  {InputPerMTok: 8, OutputPerMTok: 40, CacheReadPerMTok: 0.20, CacheWritePerMTok: 10},
 		"claude-fable-5-1":  {InputPerMTok: 10, OutputPerMTok: 50, CacheReadPerMTok: 0.25, CacheWritePerMTok: 12.5},
 		"claude-opus-5-5":   {InputPerMTok: 4, OutputPerMTok: 20, CacheReadPerMTok: 0.20, CacheWritePerMTok: 5},
-		"claude-sonnet-5-5": {InputPerMTok: 2, OutputPerMTok: 10, CacheReadPerMTok: 0.20, CacheWritePerMTok: 2.5},
+		"claude-sonnet-5-5": {InputPerMTok: 2, OutputPerMTok: 10, CacheReadPerMTok: 0.10, CacheWritePerMTok: 2.5},
 		"claude-haiku-5-5":  {InputPerMTok: 0.10, OutputPerMTok: 0.50, CacheReadPerMTok: 0.01, CacheWritePerMTok: 0.125},
 	}
 }

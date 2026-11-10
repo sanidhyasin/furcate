@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -89,7 +91,11 @@ func TestCaseExportRestoreAndSuite(t *testing.T) {
 	ctl := &controller.Controller{Driver: drv, Model: &careless{}, Store: store, Tracer: tp.Tracer("t"),
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Slots: controller.NewSlots(4)}
 	eng := &replay.Engine{Controller: ctl, Store: store, Conversations: recorded{rec}}
-	tk, _ := task.Parse([]byte(`{"id":"keep","system":"You tidy repos.","prompt":"go","check":["sh","-c","test -f fixture.txt"]}`))
+	// Setup reads the task's files, so a restore must run it on them.
+	tk, _ := task.Parse([]byte(`{"id":"keep","system":"You tidy repos.","prompt":"go",` +
+		`"setup":[["sh","-c","test -f README"]],"check":["sh","-c","test -f fixture.txt"]}`))
+	tk.Files = t.TempDir() // a local path the exported bundle must not carry
+	os.WriteFile(filepath.Join(tk.Files, "README"), []byte("repo\n"), 0o644)
 
 	orig := ctl.Start(ctx, tk)
 	if orig.Outcome != runstore.OutcomeFail {
@@ -120,6 +126,9 @@ func TestCaseExportRestoreAndSuite(t *testing.T) {
 	}
 	if !bytes.Equal(loaded[0].Request, b.Request) || len(loaded[0].Files) == 0 {
 		t.Fatal("bundle did not round-trip")
+	}
+	if bytes.Contains(loaded[0].Task, []byte(`"files"`)) {
+		t.Fatalf("bundle keeps the local files path: %s", loaded[0].Task)
 	}
 
 	fix := "You tidy repos. Never delete fixture.txt."

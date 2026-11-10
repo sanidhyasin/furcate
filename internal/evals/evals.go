@@ -10,10 +10,14 @@
 //	case.json         task spec, step, check, change, where it came from
 //	request.json      the recorded request at that step, byte for byte
 //	workdir.tar.gz    the task's working directory at that checkpoint
+//	start.tar.gz      the task's files as the run started (if it had any)
 //
-// Restoring a bundle creates a sandbox from the task's template, reruns the
-// task's setup, unpacks the files and checkpoints the result. That carries the
-// files (driver level 2) but not running processes, whichever driver runs it.
+// Restoring a bundle creates a sandbox from the task's template, unpacks the
+// starting files and reruns the task's setup on them, as the original run did,
+// so whatever setup records outside the workdir (a check's hashes of the
+// fixtures, say) matches the original. Then it swaps in the checkpoint's workdir
+// and checkpoints the result. That carries the files (driver level 2) but not
+// running processes, whichever driver runs it.
 package evals
 
 import (
@@ -54,6 +58,7 @@ type Bundle struct {
 
 	Request []byte `json:"-"` // request.json, kept verbatim
 	Files   []byte `json:"-"` // workdir.tar.gz
+	Start   []byte `json:"-"` // start.tar.gz; nil when the task had no files
 }
 
 // Source records where a case was cut from.
@@ -68,6 +73,7 @@ const (
 	caseFile    = "case.json"
 	requestFile = "request.json"
 	filesFile   = "workdir.tar.gz"
+	startFile   = "start.tar.gz"
 )
 
 // Write saves the bundle into dir.
@@ -79,7 +85,11 @@ func (b *Bundle) Write(dir string) error {
 	if err != nil {
 		return err
 	}
-	for name, data := range map[string][]byte{caseFile: append(meta, '\n'), requestFile: b.Request, filesFile: b.Files} {
+	files := map[string][]byte{caseFile: append(meta, '\n'), requestFile: b.Request, filesFile: b.Files}
+	if b.Start != nil {
+		files[startFile] = b.Start
+	}
+	for name, data := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
 			return err
 		}
@@ -101,6 +111,10 @@ func Load(dir string) (*Bundle, error) {
 		return nil, err
 	}
 	if b.Files, err = os.ReadFile(filepath.Join(dir, filesFile)); err != nil {
+		return nil, err
+	}
+	// Bundles exported before start.tar.gz existed rerun setup without files.
+	if b.Start, err = os.ReadFile(filepath.Join(dir, startFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 	return &b, nil
@@ -193,9 +207,20 @@ func Export(ctx context.Context, eng *replay.Engine, caseID string) (*Bundle, er
 		return nil, fmt.Errorf("tar the workdir: exit %d: %s", res.ExitCode, res.Stderr)
 	}
 
-	b := &Bundle{ID: c.CaseID, Notes: c.Notes, Task: run.Task, Step: c.Step, Check: c.Check,
+	// Setup reruns on the task's starting files, so the bundle carries them, and
+	// not the local directory they came from, which means nothing elsewhere.
+	start, err := t.Archive()
+	if err != nil {
+		return nil, fmt.Errorf("the task's files: %w", err)
+	}
+	t.Files = ""
+	spec, err := json.Marshal(t)
+	if err != nil {
+		return nil, err
+	}
+	b := &Bundle{ID: c.CaseID, Notes: c.Notes, Task: spec, Step: c.Step, Check: c.Check,
 		Source:  Source{RunID: c.RunID, CheckpointID: c.CheckpointID, Driver: run.Driver, Exported: time.Now().UTC()},
-		Request: body, Files: res.Stdout}
+		Request: body, Files: res.Stdout, Start: start}
 	if len(c.Change) > 0 {
 		var ch replay.Change
 		if err := json.Unmarshal(c.Change, &ch); err != nil {
@@ -252,12 +277,15 @@ func Restore(ctx context.Context, ctl *controller.Controller, b *Bundle, batch s
 		}
 		return err
 	}
-	// The task's setup, without its local files: the bundle carries the files
-	// as they were at the checkpoint.
-	noFiles := *t
-	noFiles.Files = ""
-	if err := controller.Prepare(ctx, sb, inst, &noFiles); err != nil {
+	// Setup runs on the starting files, as in the original run; then the workdir
+	// becomes the checkpoint's.
+	if err := controller.PrepareFiles(ctx, sb, inst, t, b.Start); err != nil {
 		return fail(err)
+	}
+	if b.Start != nil && t.Workdir != "" && t.Workdir != "/" {
+		if err := exec(driver.ExecRequest{Args: []string{"find", ".", "-mindepth", "1", "-delete"}, Dir: t.Workdir, Timeout: time.Minute}); err != nil {
+			return fail(fmt.Errorf("clear the starting files: %w", err))
+		}
 	}
 	if err := exec(driver.ExecRequest{Args: []string{"tar", "xzf", "-"}, Stdin: b.Files, Dir: t.Workdir, Timeout: 5 * time.Minute}); err != nil {
 		return fail(fmt.Errorf("unpack files: %w", err))

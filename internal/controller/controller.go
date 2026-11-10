@@ -399,14 +399,20 @@ func (c *Controller) finish(ctx context.Context, root trace.Span, rs *runState, 
 // Prepare readies a fresh sandbox for a task: the workdir, the task's local
 // files, then its setup commands.
 func Prepare(ctx context.Context, sb driver.Sandbox, inst driver.Instance, t *task.Task) error {
+	tgz, err := t.Archive()
+	if err != nil {
+		return err
+	}
+	return PrepareFiles(ctx, sb, inst, t, tgz)
+}
+
+// PrepareFiles is Prepare with the task's files given as a gzipped tarball (nil
+// for none) instead of read from t.Files: an eval bundle's starting files.
+func PrepareFiles(ctx context.Context, sb driver.Sandbox, inst driver.Instance, t *task.Task, tgz []byte) error {
 	if t.Workdir != "" {
 		if res, err := sb.Exec(ctx, inst, driver.ExecRequest{Args: []string{"mkdir", "-p", t.Workdir}}); err != nil || res.ExitCode != 0 {
 			return fmt.Errorf("create workdir: %v %s", err, res.Stderr)
 		}
-	}
-	tgz, err := t.Archive()
-	if err != nil {
-		return err
 	}
 	if tgz != nil {
 		res, err := sb.Exec(ctx, inst, driver.ExecRequest{Args: []string{"tar", "xzf", "-"}, Stdin: tgz, Dir: t.Workdir, Timeout: 5 * time.Minute})

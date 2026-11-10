@@ -30,11 +30,27 @@ func OpenPostgres(ctx context.Context, dsn string) (*Postgres, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	if _, err := pool.Exec(ctx, schemaSQL); err != nil {
+	if err := migrate(ctx, pool); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("create tables: %w", err)
 	}
 	return &Postgres{pool: pool}, nil
+}
+
+// migrateLock is the advisory lock key for schema changes ("furcate" in ASCII).
+const migrateLock int64 = 0x66757263617465
+
+// migrate creates the tables and adds new columns. Processes that start at the
+// same moment deadlock on each other's ALTER TABLEs, so they take turns under an
+// advisory lock held for the transaction.
+func migrate(ctx context.Context, pool *pgxpool.Pool) error {
+	return pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", migrateLock); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, schemaSQL)
+		return err
+	})
 }
 
 // Close closes the pool.

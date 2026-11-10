@@ -6,8 +6,31 @@ import (
 	"encoding/hex"
 	"errors"
 	"os"
+	"sync"
 	"testing"
 )
+
+// Processes that start together used to deadlock creating the tables.
+func TestPostgresConcurrentOpen(t *testing.T) {
+	dsn := os.Getenv("FURCATE_TEST_PG")
+	if dsn == "" {
+		t.Skip("set FURCATE_TEST_PG to run against Postgres")
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pg, err := OpenPostgres(context.Background(), dsn)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			pg.Close()
+		}()
+	}
+	wg.Wait()
+}
 
 // Runs only with FURCATE_TEST_PG set to a DSN, e.g. the docker-compose one.
 func TestPostgresStore(t *testing.T) {

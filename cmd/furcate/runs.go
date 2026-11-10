@@ -494,23 +494,33 @@ func runGC(ctx context.Context, args []string) error {
 	olderThan := fs.Duration("older-than", 24*time.Hour, "delete unpinned checkpoints older than this")
 	dry := fs.Bool("dry-run", false, "list what would be deleted")
 	fs.Parse(args)
+	// Named runs lose every unpinned checkpoint, whatever its age: the runs of a
+	// sweep you don't need to fork.
+	runs := map[string]bool{}
+	for _, id := range fs.Args() {
+		runs[id] = true
+	}
+	cutoff, what := time.Now().Add(-*olderThan), "older than "+olderThan.String()
+	if len(runs) > 0 {
+		cutoff, what = time.Now(), fmt.Sprintf("of %d runs", len(runs))
+	}
 	pg, err := runstore.OpenPostgres(ctx, *pgDSN)
 	if err != nil {
 		return err
 	}
 	defer pg.Close()
-	cps, err := pg.Expirable(ctx, time.Now().Add(-*olderThan))
+	cps, err := pg.Expirable(ctx, cutoff)
 	if err != nil {
 		return err
 	}
 	var mine []runstore.Checkpoint
 	for _, c := range cps {
-		if c.Driver == *drv {
+		if c.Driver == *drv && (len(runs) == 0 || runs[c.RunID]) {
 			mine = append(mine, c)
 		}
 	}
 	if *dry || len(mine) == 0 {
-		fmt.Printf("%d unpinned %s checkpoints older than %s\n", len(mine), *drv, *olderThan)
+		fmt.Printf("%d unpinned %s checkpoints %s\n", len(mine), *drv, what)
 		return nil
 	}
 	sb, err := newDriver(*drv)
