@@ -231,15 +231,19 @@ func keepByHash(traceID string, ratio float64) bool {
 // batcher: ClickHouse wants big inserts, not many small ones.
 
 // Batcher collects spans and inserts them when it has Size of them or Interval
-// has passed, whichever comes first. A failed insert is retried with backoff; the
-// spans stay safe in the WAL meanwhile.
+// has passed, whichever comes first, on one of its inserters: ClickHouse spends
+// a couple of cores on each insert, so one at a time leaves the rest idle. A
+// failed insert is retried with backoff; the spans stay safe in the WAL
+// meanwhile. Batches can finish out of order: the tracker releases a WAL record
+// only once all of its spans are flushed.
 type Batcher struct {
-	in       chan []model.Span
-	w        Writer
-	size     int
-	interval time.Duration
-	flushed  func([]model.Span)
-	log      *slog.Logger
+	in        chan []model.Span
+	w         Writer
+	size      int
+	interval  time.Duration
+	inserters int
+	flushed   func([]model.Span)
+	log       *slog.Logger
 
 	drainTimeout time.Duration // the final flush on shutdown gives up after this
 
@@ -251,9 +255,9 @@ type Batcher struct {
 
 const latencyWindow = 1024
 
-func newBatcher(w Writer, size int, interval time.Duration, queue int, flushed func([]model.Span), log *slog.Logger) *Batcher {
+func newBatcher(w Writer, size int, interval time.Duration, queue, inserters int, flushed func([]model.Span), log *slog.Logger) *Batcher {
 	return &Batcher{
-		in: make(chan []model.Span, queue), w: w, size: size, interval: interval,
+		in: make(chan []model.Span, queue), w: w, size: size, interval: interval, inserters: max(1, inserters),
 		flushed: flushed, log: log, drainTimeout: 10 * time.Second,
 	}
 }
@@ -267,6 +271,30 @@ func (b *Batcher) Saturated() bool { return len(b.in) >= cap(b.in) }
 // Run flushes until ctx is done, then drains what is queued and flushes it once
 // more, giving up after drainTimeout. Anything not flushed stays in the WAL.
 func (b *Batcher) Run(ctx context.Context) {
+	// Handing a batch over blocks while every inserter is busy, so the queue
+	// fills and the server pushes back, as with a single inserter.
+	jobs := make(chan []model.Span)
+	var wg sync.WaitGroup
+	for range b.inserters {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for buf := range jobs {
+				b.flush(ctx, buf)
+			}
+		}()
+	}
+	defer wg.Wait()
+	defer close(jobs)
+	handOff := func(buf []model.Span) []model.Span {
+		select {
+		case jobs <- buf:
+		case <-ctx.Done():
+			return buf // drained below
+		}
+		return make([]model.Span, 0, b.size)
+	}
+
 	buf := make([]model.Span, 0, b.size)
 	t := time.NewTicker(b.interval)
 	defer t.Stop()
@@ -275,11 +303,11 @@ func (b *Batcher) Run(ctx context.Context) {
 		case spans := <-b.in:
 			buf = append(buf, spans...)
 			if len(buf) >= b.size {
-				buf = b.flush(ctx, buf)
+				buf = handOff(buf)
 			}
 		case <-t.C:
 			if len(buf) > 0 {
-				buf = b.flush(ctx, buf)
+				buf = handOff(buf)
 			}
 		case <-ctx.Done():
 		drain:
@@ -301,7 +329,7 @@ func (b *Batcher) Run(ctx context.Context) {
 	}
 }
 
-func (b *Batcher) flush(ctx context.Context, buf []model.Span) []model.Span {
+func (b *Batcher) flush(ctx context.Context, buf []model.Span) {
 	backoff := 100 * time.Millisecond
 	for {
 		start := time.Now()
@@ -311,7 +339,7 @@ func (b *Batcher) flush(ctx context.Context, buf []model.Span) []model.Span {
 			b.batches.Add(1)
 			b.spans.Add(uint64(len(buf)))
 			b.flushed(buf)
-			return make([]model.Span, 0, b.size)
+			return
 		}
 		b.failures.Add(1)
 		b.log.Warn("insert failed; retrying", "spans", len(buf), "err", err, "backoff", backoff)
@@ -320,7 +348,7 @@ func (b *Batcher) flush(ctx context.Context, buf []model.Span) []model.Span {
 			backoff = min(backoff*2, 10*time.Second)
 		case <-ctx.Done():
 			// Shutting down: leave the spans to the WAL, replayed on next start.
-			return buf[:0]
+			return
 		}
 	}
 }

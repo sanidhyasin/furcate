@@ -128,6 +128,7 @@ func runCollector(ctx context.Context, args []string) error {
 	fs.StringVar(&cfg.GRPCAddr, "grpc", "127.0.0.1:4317", `OTLP/gRPC listen address ("off" to disable)`)
 	fs.StringVar(&cfg.WALDir, "wal-dir", envOr("FURCATE_WAL_DIR", "data/wal"), "write-ahead log directory")
 	fs.IntVar(&cfg.BatchSize, "batch-size", 10_000, "insert into ClickHouse at this many spans")
+	fs.IntVar(&cfg.Inserters, "inserters", 4, "ClickHouse inserts running at once")
 	fs.DurationVar(&cfg.FlushInterval, "flush-interval", time.Second, "or after this long")
 	fs.IntVar(&cfg.QueueSize, "queue", 1024, "export requests queued before returning 503")
 	fs.Float64Var(&cfg.SampleRatio, "sample", 1, "fraction of ordinary runs to keep (errored and checkpointed runs are always kept)")

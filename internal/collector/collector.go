@@ -47,6 +47,7 @@ type Config struct {
 
 	BatchSize     int           // flush at this many spans
 	FlushInterval time.Duration // or after this long
+	Inserters     int           // inserts running at once; default 4
 	QueueSize     int           // export requests queued before the server pushes back
 
 	SampleRatio float64       // fraction of ordinary runs kept; >= 1 keeps all
@@ -71,6 +72,9 @@ func (c *Config) defaults() {
 	}
 	if c.BatchSize <= 0 {
 		c.BatchSize = 10_000
+	}
+	if c.Inserters <= 0 {
+		c.Inserters = 4
 	}
 	if c.FlushInterval <= 0 {
 		c.FlushInterval = time.Second
@@ -132,7 +136,7 @@ func New(cfg Config, w Writer, log *slog.Logger) (*Collector, error) {
 		cfg: cfg, log: log, wal: l, seen: seen, tracker: newTracker(), ready: make(chan struct{}),
 		conv: &Converter{Seen: seen, Prices: cfg.Prices, Threshold: cfg.PayloadThreshold},
 	}
-	c.batcher = newBatcher(w, cfg.BatchSize, cfg.FlushInterval, cfg.QueueSize, c.flushed, log)
+	c.batcher = newBatcher(w, cfg.BatchSize, cfg.FlushInterval, cfg.QueueSize, cfg.Inserters, c.flushed, log)
 	c.batcher.drainTimeout = cfg.ShutdownTimeout
 	c.sampler = newSampler(cfg.SampleRatio, cfg.QuietPeriod, cfg.MaxTraceAge, c.batcher.Submit, c.tracker.done)
 	return c, nil
@@ -204,7 +208,7 @@ func (c *Collector) Run(ctx context.Context) error {
 	}
 	close(c.ready)
 	c.log.Info("collector listening", "http", httpLn.Addr().String(), "grpc", c.cfg.GRPCAddr,
-		"batch", c.cfg.BatchSize, "flush", c.cfg.FlushInterval, "sample", c.cfg.SampleRatio)
+		"batch", c.cfg.BatchSize, "inserters", c.cfg.Inserters, "flush", c.cfg.FlushInterval, "sample", c.cfg.SampleRatio)
 
 	// Release every second: the watermark it saves bounds how much a crash
 	// replays, and so how many duplicate rows recovery can write.

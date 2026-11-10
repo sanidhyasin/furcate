@@ -378,3 +378,64 @@ func TestGRPCExport(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// slowWriter records how many inserts run at once. Its first insert is the
+// slowest, so later batches finish before it.
+type slowWriter struct {
+	mu                sync.Mutex
+	live, peak, calls int
+	spans             []model.Span
+}
+
+func (w *slowWriter) Insert(_ context.Context, s []model.Span) error {
+	w.mu.Lock()
+	w.live++
+	w.peak = max(w.peak, w.live)
+	w.calls++
+	d := 20 * time.Millisecond
+	if w.calls == 1 {
+		d = 400 * time.Millisecond
+	}
+	w.mu.Unlock()
+	time.Sleep(d)
+	w.mu.Lock()
+	w.live--
+	w.spans = append(w.spans, s...)
+	w.mu.Unlock()
+	return nil
+}
+
+func (w *slowWriter) flushed() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.spans)
+}
+
+// Inserts run in parallel, and a WAL record is released only once its own
+// batch lands, even when later batches land first.
+func TestBatcherInsertsInParallelOutOfOrder(t *testing.T) {
+	tr := newTracker()
+	w := &slowWriter{}
+	b := newBatcher(w, 10, time.Hour, 64, 4, tr.done, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { b.Run(ctx); close(done) }()
+	for seq := uint64(1); seq <= 8; seq++ {
+		tr.add(seq, 10)
+		spans := make([]model.Span, 10)
+		for i := range spans {
+			spans[i].WALSeq = seq
+		}
+		b.Submit(spans)
+	}
+	waitFor(t, func() bool { return w.flushed() >= 70 }) // all but the slow first batch
+	if lw := tr.lowWater(9); lw != 1 {
+		t.Fatalf("low water %d while record 1 is still inserting, want 1", lw)
+	}
+	waitFor(t, func() bool { return tr.lowWater(9) == 9 })
+	cancel()
+	<-done
+	if w.peak < 2 || w.flushed() != 80 {
+		t.Fatalf("peak %d inserts at once, %d spans flushed: want parallel inserts and all 80", w.peak, w.flushed())
+	}
+}
