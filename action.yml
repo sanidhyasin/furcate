@@ -48,11 +48,13 @@ runs:
           -variant "name=this PR,system-file=${{ inputs.task }}" \
           -markdown "$RUNNER_TEMP/eval.md"
     - name: Comment on the pull request
-      if: always() && hashFiles(format('{0}/eval.md', runner.temp)) != ''
+      # hashFiles() only sees the workspace, not runner.temp, so check in the shell.
+      if: always()
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
       run: |
+        if [ ! -s "$RUNNER_TEMP/eval.md" ]; then echo "no report to post"; exit 0; fi
         pr="${{ github.event.pull_request.number }}"
         gh pr comment "$pr" --edit-last --body-file "$RUNNER_TEMP/eval.md" 2>/dev/null ||
           gh pr comment "$pr" --body-file "$RUNNER_TEMP/eval.md"
