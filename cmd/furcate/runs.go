@@ -159,6 +159,10 @@ func runRun(ctx context.Context, args []string) error {
 	res := e.ctl.Start(ctx, t)
 	fmt.Printf("run %s  %s  outcome=%s  steps=%d  %d LLM calls  $%.4f  %s\n", res.RunID, res.Status, orDash(res.Outcome),
 		res.Steps, res.Usage.LLMCalls, res.Usage.CostUSD, res.Duration.Round(time.Millisecond))
+	if res.Checkpoints > 0 {
+		fmt.Printf("checkpoints: %d in %s, of which the run waited %s\n", res.Checkpoints,
+			res.CheckpointTime.Round(time.Millisecond), res.CheckpointWait.Round(time.Millisecond))
+	}
 	if res.Err != nil {
 		return res.Err
 	}

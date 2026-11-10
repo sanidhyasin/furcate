@@ -45,10 +45,13 @@ const (
 	AttrStepKind     = "furcate.step.kind"
 	AttrCheckpointID = "furcate.checkpoint_id"
 	AttrCheckpointMs = "furcate.checkpoint_ms"
-	AttrLLMRequest   = "furcate.llm.request"
-	AttrLLMResponse  = "furcate.llm.response"
-	AttrDriver       = "furcate.driver"
-	AttrCostUSD      = "furcate.cost_usd"
+	// AttrCheckpointWaitMs is how long the step waited for its checkpoint after the
+	// model answered: the checkpoint's cost to the run, as it overlaps the call.
+	AttrCheckpointWaitMs = "furcate.checkpoint_wait_ms"
+	AttrLLMRequest       = "furcate.llm.request"
+	AttrLLMResponse      = "furcate.llm.response"
+	AttrDriver           = "furcate.driver"
+	AttrCostUSD          = "furcate.cost_usd"
 )
 
 // MaxTokens per model call. Requests are not streamed, so this stays at a size
@@ -78,9 +81,11 @@ type Result struct {
 	Steps    int    // last step index
 	Usage    runstore.Usage
 	Duration time.Duration
-	// Checkpoints taken and the time they took: the per-step overhead.
+	// Checkpoints taken and the time they took. They overlap the model calls;
+	// CheckpointWait is the part the run waited for: the per-step overhead.
 	Checkpoints    int
 	CheckpointTime time.Duration
+	CheckpointWait time.Duration
 	Err            error
 }
 
@@ -92,6 +97,14 @@ type runState struct {
 	files  map[string]string
 	cps    int
 	cpTime time.Duration
+	cpWait time.Duration
+}
+
+// checkpointResult is a checkpoint taken while the model call runs.
+type checkpointResult struct {
+	id  string
+	dur time.Duration
+	err error
 }
 
 // Branch says where a continuation came from.
@@ -200,18 +213,21 @@ func (c *Controller) drive(ctx context.Context, root trace.Span, rs *runState, t
 			c.Log.Info("max steps reached", "run", rs.id, "steps", llmCalls)
 			break
 		}
-		cpID, cpDur := firstCP, time.Duration(0)
-		if cpID == "" {
-			var err error
-			if cpID, cpDur, err = c.checkpoint(ctx, rs.id, step, inst); err != nil {
-				return c.finish(ctx, root, rs, step, "", err)
-			}
-			rs.cps++
-			rs.cpTime += cpDur
+		// The checkpoint runs while the model thinks. The agent can't change the
+		// sandbox until the reply arrives, so a snapshot taken at any moment of the
+		// call holds the state the request was made in; the step waits for it only
+		// after the reply, before any tool runs. A branch's first step reuses its
+		// parent's checkpoint.
+		var pending chan checkpointResult
+		if firstCP == "" {
+			pending = make(chan checkpointResult, 1)
+			go func(step int) {
+				id, d, err := c.checkpoint(ctx, rs.id, step, inst)
+				pending <- checkpointResult{id, d, err}
+			}(step)
 		}
+		msg, err := c.callModel(ctx, rs, step, firstCP, pending, conv)
 		firstCP = ""
-
-		msg, err := c.callModel(ctx, rs, step, cpID, cpDur, conv)
 		if err != nil {
 			return c.finish(ctx, root, rs, step, "", err)
 		}
@@ -277,9 +293,41 @@ func (c *Controller) checkpoint(ctx context.Context, runID string, step int, ins
 	return cp.CheckpointID, took, nil
 }
 
-func (c *Controller) callModel(ctx context.Context, rs *runState, step int, cpID string, cpDur time.Duration,
+// callModel sends the step's request. cpID is the step's checkpoint when it is
+// already known; otherwise pending delivers it, and callModel waits for it after
+// the reply, before recording the step.
+func (c *Controller) callModel(ctx context.Context, rs *runState, step int, cpID string, pending <-chan checkpointResult,
 	conv *agent.Conversation) (*anthropic.Message, error) {
 	runID := rs.id
+	waitCheckpoint := func() error { return nil }
+	if pending != nil {
+		waited := false
+		waitCheckpoint = func() error {
+			if waited {
+				return nil
+			}
+			waited = true
+			start := time.Now()
+			r := <-pending
+			wait := time.Since(start)
+			if r.err != nil {
+				return r.err
+			}
+			cpID = r.id
+			rs.cps++
+			rs.cpTime += r.dur
+			rs.cpWait += wait
+			trace.SpanFromContext(ctx).SetAttributes(
+				attribute.String(AttrCheckpointID, cpID),
+				attribute.Float64(AttrCheckpointMs, float64(r.dur.Microseconds())/1000),
+				attribute.Float64(AttrCheckpointWaitMs, float64(wait.Microseconds())/1000),
+			)
+			return nil
+		}
+		// Whatever happens to the call, the checkpoint finishes before the step
+		// does, so nothing runs in the sandbox while it is taken.
+		defer waitCheckpoint()
+	}
 
 	req, err := conv.Body()
 	if err != nil {
@@ -294,13 +342,17 @@ func (c *Controller) callModel(ctx context.Context, rs *runState, step int, cpID
 			attribute.String(AttrRunID, runID),
 			attribute.Int(AttrStepIndex, step),
 			attribute.String(AttrStepKind, runstore.KindLLM),
-			attribute.String(AttrCheckpointID, cpID),
-			attribute.Float64(AttrCheckpointMs, float64(cpDur.Microseconds())/1000),
 			attribute.String(AttrLLMRequest, string(req)),
 		))
 	defer span.End()
+	if pending == nil {
+		span.SetAttributes(attribute.String(AttrCheckpointID, cpID))
+	}
 
 	msg, err := c.Model.Send(ctx, req)
+	if cerr := waitCheckpoint(); cerr != nil {
+		err = errors.Join(err, cerr)
+	}
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -393,7 +445,7 @@ func (c *Controller) finish(ctx context.Context, root trace.Span, rs *runState, 
 		runErr = errors.Join(runErr, fmt.Errorf("record finish: %w", err))
 	}
 	return Result{RunID: rs.id, Status: status, Outcome: outcome, Steps: lastStep, Usage: rs.usage,
-		Duration: time.Since(rs.start), Checkpoints: rs.cps, CheckpointTime: rs.cpTime, Err: runErr}
+		Duration: time.Since(rs.start), Checkpoints: rs.cps, CheckpointTime: rs.cpTime, CheckpointWait: rs.cpWait, Err: runErr}
 }
 
 // Prepare readies a fresh sandbox for a task: the workdir, the task's local

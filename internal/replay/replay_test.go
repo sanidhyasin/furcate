@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go/v2"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -395,5 +396,55 @@ func TestAgreement(t *testing.T) {
 		if got := stats.Agreement(c.k, c.n); math.Abs(got-c.want) > 1e-9 {
 			t.Errorf("Agreement(%d, %d) = %.4f, want %.4f", c.k, c.n, got, c.want)
 		}
+	}
+}
+
+// slowModel and slowCheckpoints each take d per call, like a model's latency and
+// a snapshot's wait for the disk.
+type slowModel struct {
+	agent.Model
+	d time.Duration
+}
+
+func (m slowModel) Send(ctx context.Context, body []byte) (*anthropic.Message, error) {
+	time.Sleep(m.d)
+	return m.Model.Send(ctx, body)
+}
+
+type slowCheckpoints struct {
+	*testdir.Driver
+	d time.Duration
+}
+
+func (s slowCheckpoints) Checkpoint(ctx context.Context, inst driver.Instance) (driver.CheckpointID, error) {
+	time.Sleep(s.d)
+	return s.Driver.Checkpoint(ctx, inst)
+}
+
+// A checkpoint is taken while the model call runs, so a step costs the longer
+// of the two, not their sum; every LLM step still has its checkpoint.
+func TestCheckpointsOverlapModelCalls(t *testing.T) {
+	h := newHarness(t)
+	const d = 100 * time.Millisecond
+	h.ctl.Model = slowModel{h.model, d}
+	h.ctl.Driver = slowCheckpoints{h.drv, d}
+	ctx := context.Background()
+	orig := h.ctl.Start(ctx, h.task)
+	if orig.Err != nil || orig.Checkpoints != 4 {
+		t.Fatalf("run: %+v", orig)
+	}
+	if orig.CheckpointTime < 4*d || orig.CheckpointWait > orig.CheckpointTime/2 {
+		t.Fatalf("checkpoints took %s and the run waited %s for them: want most of it hidden", orig.CheckpointTime, orig.CheckpointWait)
+	}
+	steps, _ := h.store.Steps(ctx, orig.RunID)
+	for _, s := range steps {
+		if (s.Kind == runstore.KindLLM) != (s.CheckpointID != "") {
+			t.Fatalf("step %d (%s): checkpoint %q", s.Index, s.Kind, s.CheckpointID)
+		}
+	}
+	// Forks of it still restore the right state.
+	res, err := h.engine.Fork(ctx, Request{RunID: orig.RunID, Step: 5, N: 2, Change: Change{AppendSystem: "Never delete fixture.txt."}})
+	if err != nil || res.Passes != 2 {
+		t.Fatalf("fork: %v, %d/2 passed", err, res.Passes)
 	}
 }
