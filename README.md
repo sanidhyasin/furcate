@@ -20,7 +20,7 @@ Opus 5.5, on Docker and on tine, and the numbers below include a bare-metal run
 | 1 | OTLP collector with a write-ahead log, ClickHouse trace store, payload table, CLI, load generator | ingest and query numbers published | **met**: laptop and c5d.metal |
 | 2 | driver interface; tine and Docker drivers; run controller; `furcate fork` | a fork of step k matches its files and conversation; step overhead measured | **met on tine** |
 | 3 | bisect, branch compare, fork scheduler, checkpoint gc | bisect finds the faulty step of a real failure on tine and Docker | **met**: both name step 5 of a real Opus 5.5 failure |
-| 4 | eval cases, portable bundles, `furcate eval run`, GitHub Action | a prompt change in a real repo shows its pass-rate change on the PR | **met locally** (7/30 to 30/30); the PR comment needs the key as a repo secret |
+| 4 | eval cases, portable bundles, `furcate eval run`, GitHub Action | a prompt change in a real repo shows its pass-rate change on the PR | **met**: on [PR #1](https://github.com/sanidhyasin/furcate/pull/1) the Action commented 1/15 on main, 15/15 with the PR's prompt |
 | 5 | drop-in mode for unmodified agents, web UI with "fork from here" | an unmodified Claude Code run forked from any LLM call | **met**: Claude Code 2.1.322 forked from requests 2 and 3 |
 
 ## Quick start

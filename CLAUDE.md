@@ -87,5 +87,5 @@ sandbox driver, then fork, bisect and build evals from any step. Working name wa
   forks keep the network to reach the proxy.
 - Eval export reads the task's starting files from disk (`task.files`); if they
   changed since the run, the bundle's setup sees the new ones.
-- The Phase 4 PR comment hasn't run on GitHub: the repo has no ANTHROPIC_API_KEY
-  secret yet, and adding one is the user's call.
+- The repo has an ANTHROPIC_API_KEY Actions secret (set by the user, 2026-11-10);
+  every PR that touches examples/csv-report or evals runs the eval (~$1).
