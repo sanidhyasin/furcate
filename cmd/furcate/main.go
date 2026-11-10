@@ -45,6 +45,7 @@ Usage:
   furcate eval ...                 checkpoints as test cases: add, list, export, run
   furcate gc [-older-than 24h]     delete unpinned checkpoints from the driver
   furcate dropin run|fork ...      record and fork an unmodified agent (Claude Code)
+  furcate serve [-driver docker]   web UI and HTTP API on 127.0.0.1:7070
 
 Run "furcate <command> -h" for a command's flags.
 `
@@ -94,6 +95,8 @@ func main() {
 		err = runGC(ctx, args)
 	case "dropin":
 		err = runDropIn(ctx, args)
+	case "serve":
+		err = runServe(ctx, args)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:

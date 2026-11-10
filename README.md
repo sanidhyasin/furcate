@@ -21,7 +21,7 @@ the build environment is rejected).
 | 2 | driver interface; tine and Docker drivers; run controller; `furcate fork` | a fork of step k matches its files and conversation; step overhead measured | **met on tine** |
 | 3 | bisect, branch compare, fork scheduler, checkpoint gc | bisect finds the faulty step of a real failure on tine and Docker | met with a scripted agent; real-model failure pending |
 | 4 | eval cases, portable bundles, `furcate eval run`, GitHub Action | a prompt change in a real repo shows its pass-rate change on the PR | built; needs a key and the repo secret |
-| 5 | drop-in mode for unmodified agents, web UI | an unmodified Claude Code run forked from any LLM call | drop-in tested with a transcript-keeping agent; Claude Code run pending |
+| 5 | drop-in mode for unmodified agents, web UI with "fork from here" | an unmodified Claude Code run forked from any LLM call | drop-in tested with a transcript-keeping agent; UI built; Claude Code run pending |
 
 ## Quick start
 
@@ -45,7 +45,13 @@ Then, with `ANTHROPIC_API_KEY` set:
 ./bin/furcate eval run -variant name=main -variant name=careful,system-file=examples/csv-report/task-careful.json
 ./bin/furcate dropin run -task examples/claude-code/task.json -driver docker
 ./bin/furcate gc -driver docker -older-than 24h
+./bin/furcate serve -driver docker           # web UI on http://127.0.0.1:7070
 ```
+
+The web UI lists runs, shows a run's trace as a waterfall with its checkpoints,
+opens any prompt, completion or tool output, forks from any LLM step ("Fork from
+here"), charts each branch group's pass rate with its interval, and compares two
+runs' outcomes, costs and final files. Without `-driver` it is read-only.
 
 Any OpenTelemetry SDK can also send plain traces to `http://localhost:4318/v1/traces`
 (`runs`, `trace`, `stats` work on them); the rewind features need a sandbox driver.
