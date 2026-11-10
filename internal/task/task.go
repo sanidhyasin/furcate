@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -32,6 +33,29 @@ type Task struct {
 	Check []string `json:"check"`
 	// ToolTimeout bounds one tool call. Default 2 minutes.
 	ToolTimeout Duration `json:"tool_timeout,omitempty"`
+	// DropIn runs an unmodified agent in the sandbox instead of Furcate's loop.
+	DropIn *DropIn `json:"dropin,omitempty"`
+}
+
+// DropIn is how to start and resume an agent that runs inside the sandbox.
+// "{prompt}" in Command and "{instruction}" in Resume are filled in.
+type DropIn struct {
+	Command []string          `json:"command"`           // e.g. ["claude", "-p", "{prompt}", "--dangerously-skip-permissions"]
+	Resume  []string          `json:"resume"`            // e.g. ["claude", "--continue", "-p", "{instruction}", ...]
+	Env     map[string]string `json:"env,omitempty"`     // extra environment for the agent
+	Timeout Duration          `json:"timeout,omitempty"` // default 30 minutes
+}
+
+// Expand fills placeholders in a command.
+func Expand(args []string, vars map[string]string) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		for k, v := range vars {
+			a = strings.ReplaceAll(a, "{"+k+"}", v)
+		}
+		out[i] = a
+	}
+	return out
 }
 
 // Duration reads "90s" style JSON strings.

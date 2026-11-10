@@ -44,6 +44,7 @@ Usage:
   furcate compare <run-a> <run-b>  outcome, cost and final files of two runs
   furcate eval ...                 checkpoints as test cases: add, list, export, run
   furcate gc [-older-than 24h]     delete unpinned checkpoints from the driver
+  furcate dropin run|fork ...      record and fork an unmodified agent (Claude Code)
 
 Run "furcate <command> -h" for a command's flags.
 `
@@ -91,6 +92,8 @@ func main() {
 		err = runEval(ctx, args)
 	case "gc":
 		err = runGC(ctx, args)
+	case "dropin":
+		err = runDropIn(ctx, args)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:

@@ -149,17 +149,8 @@ func (c *Controller) Start(ctx context.Context, t *task.Task) Result {
 	}
 	defer c.destroy(inst)
 
-	if err := c.copyFiles(ctx, inst, t); err != nil {
+	if err := Prepare(ctx, c.Driver, inst, t); err != nil {
 		return c.finish(ctx, root, rs, 0, "", err)
-	}
-	for _, cmd := range t.Setup {
-		res, err := c.Driver.Exec(ctx, inst, driver.ExecRequest{Args: cmd, Dir: t.Workdir, Timeout: t.ToolTimeout.Duration})
-		if err == nil && res.ExitCode != 0 {
-			err = fmt.Errorf("exit %d: %s%s", res.ExitCode, res.Stdout, res.Stderr)
-		}
-		if err != nil {
-			return c.finish(ctx, root, rs, 0, "", fmt.Errorf("setup %q: %w", cmd, err))
-		}
 	}
 	conv, err := agent.NewConversation(InitialParams(t))
 	if err != nil {
@@ -254,7 +245,7 @@ func (c *Controller) drive(ctx context.Context, root trace.Span, rs *runState, t
 		}
 	}
 
-	rs.files = c.manifest(ctx, inst, t.Workdir)
+	rs.files = Manifest(ctx, c.Driver, inst, t.Workdir)
 	res, err := c.Driver.Exec(ctx, inst, driver.ExecRequest{Args: t.Check, Dir: t.Workdir, Timeout: 10 * time.Minute})
 	if err != nil {
 		return c.finish(ctx, root, rs, step-1, "", fmt.Errorf("check: %w", err))
@@ -405,23 +396,35 @@ func (c *Controller) finish(ctx context.Context, root trace.Span, rs *runState, 
 		Duration: time.Since(rs.start), Checkpoints: rs.cps, CheckpointTime: rs.cpTime, Err: runErr}
 }
 
-// copyFiles unpacks the task's local files into the workdir.
-func (c *Controller) copyFiles(ctx context.Context, inst driver.Instance, t *task.Task) error {
+// Prepare readies a fresh sandbox for a task: the workdir, the task's local
+// files, then its setup commands.
+func Prepare(ctx context.Context, sb driver.Sandbox, inst driver.Instance, t *task.Task) error {
 	if t.Workdir != "" {
-		if res, err := c.Driver.Exec(ctx, inst, driver.ExecRequest{Args: []string{"mkdir", "-p", t.Workdir}}); err != nil || res.ExitCode != 0 {
+		if res, err := sb.Exec(ctx, inst, driver.ExecRequest{Args: []string{"mkdir", "-p", t.Workdir}}); err != nil || res.ExitCode != 0 {
 			return fmt.Errorf("create workdir: %v %s", err, res.Stderr)
 		}
 	}
 	tgz, err := t.Archive()
-	if err != nil || tgz == nil {
+	if err != nil {
 		return err
 	}
-	res, err := c.Driver.Exec(ctx, inst, driver.ExecRequest{Args: []string{"tar", "xzf", "-"}, Stdin: tgz, Dir: t.Workdir, Timeout: 5 * time.Minute})
-	if err == nil && res.ExitCode != 0 {
-		err = fmt.Errorf("exit %d: %s", res.ExitCode, res.Stderr)
+	if tgz != nil {
+		res, err := sb.Exec(ctx, inst, driver.ExecRequest{Args: []string{"tar", "xzf", "-"}, Stdin: tgz, Dir: t.Workdir, Timeout: 5 * time.Minute})
+		if err == nil && res.ExitCode != 0 {
+			err = fmt.Errorf("exit %d: %s", res.ExitCode, res.Stderr)
+		}
+		if err != nil {
+			return fmt.Errorf("copy task files: %w", err)
+		}
 	}
-	if err != nil {
-		return fmt.Errorf("copy task files: %w", err)
+	for _, cmd := range t.Setup {
+		res, err := sb.Exec(ctx, inst, driver.ExecRequest{Args: cmd, Dir: t.Workdir, Timeout: t.ToolTimeout.Duration})
+		if err == nil && res.ExitCode != 0 {
+			err = fmt.Errorf("exit %d: %s%s", res.ExitCode, res.Stdout, res.Stderr)
+		}
+		if err != nil {
+			return fmt.Errorf("setup %q: %w", cmd, err)
+		}
 	}
 	return nil
 }
@@ -429,11 +432,11 @@ func (c *Controller) copyFiles(ctx context.Context, inst driver.Instance, t *tas
 // MaxManifestFiles bounds the final-files manifest.
 const MaxManifestFiles = 5000
 
-// manifest hashes every file under the workdir (skipping .git) when the run
+// Manifest hashes every file under the workdir (skipping .git) when a run
 // ends, so two branches' final states can be compared. Best effort: a sandbox
-// without sha256sum just yields no manifest.
-func (c *Controller) manifest(ctx context.Context, inst driver.Instance, workdir string) map[string]string {
-	res, err := c.Driver.Exec(ctx, inst, driver.ExecRequest{
+// without sha256sum or shasum just yields no manifest.
+func Manifest(ctx context.Context, sb driver.Sandbox, inst driver.Instance, workdir string) map[string]string {
+	res, err := sb.Exec(ctx, inst, driver.ExecRequest{
 		Args: []string{"sh", "-c", `h=sha256sum; command -v sha256sum >/dev/null || h="shasum -a 256"; ` +
 			`find . -type f -not -path './.git/*' -not -path '*/__pycache__/*' -exec $h {} + 2>/dev/null | head -n ` +
 			fmt.Sprint(MaxManifestFiles)},

@@ -252,15 +252,12 @@ func Restore(ctx context.Context, ctl *controller.Controller, b *Bundle, batch s
 		}
 		return err
 	}
-	for _, cmd := range t.Setup {
-		if err := exec(driver.ExecRequest{Args: cmd, Dir: t.Workdir, Timeout: t.ToolTimeout.Duration}); err != nil {
-			return fail(fmt.Errorf("setup: %w", err))
-		}
-	}
-	if t.Workdir != "" {
-		if err := exec(driver.ExecRequest{Args: []string{"mkdir", "-p", t.Workdir}}); err != nil {
-			return fail(err)
-		}
+	// The task's setup, without its local files: the bundle carries the files
+	// as they were at the checkpoint.
+	noFiles := *t
+	noFiles.Files = ""
+	if err := controller.Prepare(ctx, sb, inst, &noFiles); err != nil {
+		return fail(err)
 	}
 	if err := exec(driver.ExecRequest{Args: []string{"tar", "xzf", "-"}, Stdin: b.Files, Dir: t.Workdir, Timeout: 5 * time.Minute}); err != nil {
 		return fail(fmt.Errorf("unpack files: %w", err))

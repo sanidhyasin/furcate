@@ -25,6 +25,7 @@ import (
 	"github.com/sanidhyasin/furcate/internal/driver"
 	"github.com/sanidhyasin/furcate/internal/driver/docker"
 	"github.com/sanidhyasin/furcate/internal/driver/tine"
+	"github.com/sanidhyasin/furcate/internal/dropin"
 	"github.com/sanidhyasin/furcate/internal/pricing"
 	"github.com/sanidhyasin/furcate/internal/replay"
 	"github.com/sanidhyasin/furcate/internal/runstore"
@@ -527,5 +528,63 @@ func runGC(ctx context.Context, args []string) error {
 		deleted++
 	}
 	fmt.Printf("deleted %d %s checkpoints; %d still in use, kept for next time\n", deleted, *drv, kept)
+	return nil
+}
+
+func runDropIn(ctx context.Context, args []string) error {
+	if len(args) == 0 || (args[0] != "run" && args[0] != "fork") {
+		return errors.New("usage: furcate dropin run -task t.json | furcate dropin fork -step k [-n 5] [-append-system s] [-model m] <run-id>")
+	}
+	fs := flag.NewFlagSet("dropin "+args[0], flag.ExitOnError)
+	f := addRunFlags(fs)
+	taskPath := fs.String("task", "", "task spec with a dropin section (run)")
+	step := fs.Int("step", 0, "LLM request to fork from (fork)")
+	n := fs.Int("n", 5, "continuations (fork)")
+	model := fs.String("model", "", "change: rewrite every request to this model (fork)")
+	instruction := fs.String("append-system", "", "change: what the resumed agent is told (fork)")
+	listen := fs.String("listen", envOr("FURCATE_DROPIN_LISTEN", "127.0.0.1:0"), "where each run's recording proxy listens")
+	sandboxHost := fs.String("sandbox-host", envOr("FURCATE_DROPIN_HOST", "host.docker.internal"), "how the sandbox reaches the proxy")
+	fs.Parse(args[1:])
+	key := os.Getenv("ANTHROPIC_API_KEY")
+	if key == "" {
+		return errors.New("drop-in needs ANTHROPIC_API_KEY on the host: the proxy adds it to the agent's requests")
+	}
+	e, err := openEnv(ctx, f)
+	if err != nil {
+		return err
+	}
+	defer e.cleanup()
+	eng := &dropin.Engine{Driver: e.ctl.Driver, Store: e.pg, Tracer: e.ctl.Tracer, Prices: e.ctl.Prices, Slots: e.ctl.Slots,
+		Log: e.ctl.Log, APIKey: key, Listen: *listen, SandboxHost: *sandboxHost}
+	if args[0] == "run" {
+		if *taskPath == "" {
+			return errors.New("dropin run needs -task")
+		}
+		t, err := task.Load(*taskPath)
+		if err != nil {
+			return err
+		}
+		res := eng.Start(ctx, t)
+		fmt.Printf("run %s  %s  outcome=%s  %d requests  $%.4f  %s\n", res.RunID, res.Status, orDash(res.Outcome),
+			res.Usage.LLMCalls, res.Usage.CostUSD, res.Duration.Round(time.Millisecond))
+		return res.Err
+	}
+	if fs.NArg() != 1 || *step <= 0 {
+		return errors.New("usage: furcate dropin fork -step k [-n 5] [-append-system s] [-model m] <run-id>")
+	}
+	res, err := eng.Fork(ctx, replay.Request{RunID: fs.Arg(0), Step: *step, N: *n,
+		Change: replay.Change{Model: *model, AppendSystem: *instruction}})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("drop-in fork of %s at step %d: passed %d of %d (95%% CI %.2f-%.2f)  $%.4f\n",
+		res.RunID, res.Step, res.Passes, res.Done, res.Lo, res.Hi, res.Usage.CostUSD)
+	for _, b := range res.Branches {
+		line := fmt.Sprintf("  %s  %s  %s", b.RunID, b.Status, orDash(b.Outcome))
+		if b.Err != nil {
+			line += "  " + b.Err.Error()
+		}
+		fmt.Println(line)
+	}
 	return nil
 }
