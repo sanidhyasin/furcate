@@ -40,6 +40,11 @@ sandbox driver, then fork, bisect and build evals from any step. Working name wa
 
 - Go 1.26, one binary in cmd/furcate, packages under internal/.
 - `go test -race ./...` must pass. ClickHouse runs via `docker compose up -d --wait`.
+  On macOS, a -race test that execs many processes at once can hang: a forked
+  child spins at 100% CPU in `__tsan::TraceSwitchPartImpl` before exec (a race
+  detector bug, seen 2026-11-10 with Go 1.26.3) and holds the parent's pipes.
+  `sample <pid>` on the busy child shows it; kill the test processes by PID and
+  rerun. Not a Furcate bug.
 - The loadgen and collector are the same binary: never `pkill -x furcate` during a
   load test, or the load generator dies too. Kill by PID.
 - Bound times to ClickHouse as `UnixNano()` with `fromUnixTimestamp64Nano(?)`: the

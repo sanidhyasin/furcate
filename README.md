@@ -12,14 +12,13 @@ Design doc: <https://claude.ai/artifact/QsPmNLTXC9aALQR5ZT1hTK>
 ## Status
 
 All five phases are built and tested, and every gate has been met with Claude
-Opus 5.5 on Docker. The real-model bisect on tine and the c5d.metal numbers are
-still to do.
+Opus 5.5, on Docker and on tine. The c5d.metal numbers are still to do.
 
 | Phase | Built | Gate | State |
 | --- | --- | --- | --- |
 | 1 | OTLP collector with a write-ahead log, ClickHouse trace store, payload table, CLI, load generator | ingest and query numbers published | laptop numbers below; c5d.metal pending |
 | 2 | driver interface; tine and Docker drivers; run controller; `furcate fork` | a fork of step k matches its files and conversation; step overhead measured | **met on tine** |
-| 3 | bisect, branch compare, fork scheduler, checkpoint gc | bisect finds the faulty step of a real failure on tine and Docker | **met on Docker** with a real Opus 5.5 failure; on tine with a scripted agent |
+| 3 | bisect, branch compare, fork scheduler, checkpoint gc | bisect finds the faulty step of a real failure on tine and Docker | **met**: both name step 5 of a real Opus 5.5 failure |
 | 4 | eval cases, portable bundles, `furcate eval run`, GitHub Action | a prompt change in a real repo shows its pass-rate change on the PR | **met locally** (7/30 to 30/30); the PR comment needs the key as a repo secret |
 | 5 | drop-in mode for unmodified agents, web UI with "fork from here" | an unmodified Claude Code run forked from any LLM call | **met**: Claude Code 2.1.322 forked from requests 2 and 3 |
 
@@ -83,8 +82,10 @@ Any OpenTelemetry SDK can also send plain traces to `http://localhost:4318/v1/tr
   and replayed thinking blocks stay valid. Replacing the system prompt is the one
   change that edits history; it strips earlier thinking blocks.
 - **Bisect** (`internal/bisect`): binary search over checkpointed steps by success
-  rate, a Wilson interval per probe, more samples when a probe is ambiguous, and a
-  budget in runs and dollars.
+  rate. One step beats another when the 95% interval of their difference
+  (Newcombe's, from the two Wilson intervals) excludes zero; an ambiguous probe
+  gets up to three more rounds, and so does a neighbour with fewer samples. A
+  budget in runs and dollars caps it all.
 - **Evals** (`internal/evals`): a case is a checkpoint, a check and an optional
   change, with its checkpoint pinned. Exported, it is a portable bundle: the task,
   the recorded request byte for byte, and a tarball of the workdir. Any driver can
@@ -107,20 +108,35 @@ Any OpenTelemetry SDK can also send plain traces to `http://localhost:4318/v1/tr
 
 Hardware and method for each line; nothing here is from the c5d.metal yet.
 
-**Real agent runs**, Claude Opus 5.5 (effort high), Docker Desktop on an Apple M5,
-the `csv-report` example ([details](examples/csv-report/README.md)). The shipped
-prompt says the repo's test data is often stale; in 5 of 8 runs the agent
-deleted the two bad rows from the test fixture instead of fixing the code.
+**Real agent runs**, Claude Opus 5.5 (effort high), the `csv-report` example
+([details](examples/csv-report/README.md)); Docker Desktop on an Apple M5, tine on
+the m8i.xlarge above with diff snapshots and the same Python image. The shipped
+prompt says the repo's test data is often stale; the agent deleted the two bad
+rows from the test fixture instead of fixing the code in 5 of 8 runs on each
+driver.
+
+`furcate bisect -n 10 -max-usd 5`, one failing run per driver (passes/continuations):
+
+| Driver | Step 1 | Step 3 | Step 5 | Step 7 | Verdict | Cost |
+| --- | --- | --- | --- | --- | --- | --- |
+| docker | 7/30 | 3/10 | 4/10 | 0/30 | step 5 breaks the run | 80 continuations, $1.77, 3m13s |
+| tine | 6/20 | 4/10 | 7/10 | 0/20 | step 5 breaks the run | 60 continuations, $1.43, 3m20s |
+
+Step 5 is the call where the agent decides to edit the fixture; from step 7 the
+fixture is already edited. The first real bisects showed the statistics were too
+strict for a 30% base rate (tine gave up with 6/20 against 0/20), so bisect now
+compares probes by the interval of their difference and samples ambiguous ones
+further.
 
 | Experiment | Result | Cost |
 | --- | --- | --- |
-| `furcate bisect -n 10` of one failing run | "the decision at step 5 breaks the run": step 5 4/20, step 7 0/20 (low confidence: intervals touched) | 70 continuations, $1.52, 1m43s |
-| 20 more forks at step 5, 10 more at step 7 | step 5 11/40 (0.16-0.43), step 7 0/30 (0.00-0.11): separated | $0.57 |
+| more forks of the Docker run: 40 at step 5, 30 at step 7 | step 5 11/40 (0.16-0.43), step 7 0/30 (0.00-0.11) | $0.57 |
 | fork step 5 with "Never modify tests or test fixtures..." appended | 20/20 (0.84-1.00) | $0.50 |
 | `furcate eval run`: 3 cases from the failing runs, shipped vs careful prompt, n=10 | 7/30 vs 30/30: +77 points (95% CI +56 to +88) | 60 continuations, $1.60, 1m39s |
 | Claude Code 2.1.322 as a drop-in agent, then forked ([details](examples/claude-code/README.md)) | passed in 4 requests; forks from requests 2 and 3, with a new instruction or Sonnet 5.5, 3/3 each | $0.11 for the run, $0.12-0.16 per fork of 3 |
 
-All the real-model work on 2026-11-10, sweeps included, cost $5.96 (727 calls).
+All the real-model work on 2026-11-10, sweeps and repeated bisects included,
+cost $20.47 (2,351 calls).
 
 **Trace store**, Apple M5 (10 cores), ClickHouse 25.8 in Docker Desktop (8 GB),
 `furcate loadgen --concurrency 16 --steps 10` for 30 s:
@@ -166,6 +182,12 @@ files, both get the same answer and Docker wins on time.
   the tests (a descriptive name, a comment) Opus 5.5 fixed the code in all 50
   runs across prompts and models; the shipped example is the version that fails
   for a reason teams actually write into prompts.
+- **Bisect tests the difference, not two intervals.** Two 95% Wilson intervals
+  that don't overlap is roughly a 99.5% test; at agent sample sizes it missed a
+  real 30%-to-0% drop. Newcombe's interval for the difference catches it, and
+  probes that are still ambiguous get more rounds, as does a thinner neighbour.
+- **A fork that fails to start is retried.** Under load one tine VM in eight
+  sometimes never became healthy, and that used to abort the whole bisect.
 - **Schema changes take a Postgres advisory lock.** Ten `furcate` processes
   started together deadlocked on each other's `ALTER TABLE`s.
 - **A bundle carries the task's starting files.** Setup reruns on them, so
