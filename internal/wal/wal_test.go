@@ -195,3 +195,10 @@ func TestReplaySkipsFlushedRecords(t *testing.T) {
 		t.Fatalf("replayed %v, want records 3..5 only", got)
 	}
 }
+
+func TestReleaseBeforeReplay(t *testing.T) {
+	w := open(t, t.TempDir(), 1<<20)
+	if n, err := w.Release(10); n != 0 || err != nil {
+		t.Fatalf("release on a log never opened: %d %v", n, err)
+	}
+}

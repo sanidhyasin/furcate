@@ -286,6 +286,9 @@ func (w *WAL) syncThrough(seq uint64) error {
 func (w *WAL) Release(lowWater uint64) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if len(w.segs) == 0 { // never replayed, so never opened: nothing to release
+		return 0, nil
+	}
 	if cur := w.segs[len(w.segs)-1]; w.f != nil && cur.lastSeq != 0 && cur.lastSeq < lowWater {
 		if err := w.rotate(); err != nil {
 			return 0, err

@@ -108,7 +108,12 @@ type Collector struct {
 
 	requests, received, rejected atomic.Uint64
 	walReleased                  atomic.Uint64
+
+	ready chan struct{} // closed once the WAL is replayed and the servers listen
 }
+
+// Ready is closed once the collector has replayed its WAL and accepts requests.
+func (c *Collector) Ready() <-chan struct{} { return c.ready }
 
 var (
 	errBusy       = errors.New("collector is saturated; retry later")
@@ -124,7 +129,7 @@ func New(cfg Config, w Writer, log *slog.Logger) (*Collector, error) {
 	}
 	seen := blob.NewSeen(cfg.SeenCapacity)
 	c := &Collector{
-		cfg: cfg, log: log, wal: l, seen: seen, tracker: newTracker(),
+		cfg: cfg, log: log, wal: l, seen: seen, tracker: newTracker(), ready: make(chan struct{}),
 		conv: &Converter{Seen: seen, Prices: cfg.Prices, Threshold: cfg.PayloadThreshold},
 	}
 	c.batcher = newBatcher(w, cfg.BatchSize, cfg.FlushInterval, cfg.QueueSize, c.flushed, log)
@@ -197,6 +202,7 @@ func (c *Collector) Run(ctx context.Context) error {
 			}
 		}()
 	}
+	close(c.ready)
 	c.log.Info("collector listening", "http", httpLn.Addr().String(), "grpc", c.cfg.GRPCAddr,
 		"batch", c.cfg.BatchSize, "flush", c.cfg.FlushInterval, "sample", c.cfg.SampleRatio)
 

@@ -289,6 +289,13 @@ func startCollector(t *testing.T, walDir string, w Writer) (*Collector, context.
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- c.Run(ctx) }()
+	select {
+	case <-c.Ready():
+	case err := <-done:
+		t.Fatalf("collector stopped before it was ready: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("collector not ready after 10s")
+	}
 	return c, cancel, done
 }
 
