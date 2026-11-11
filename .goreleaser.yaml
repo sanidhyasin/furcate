@@ -1,0 +1,37 @@
+# Release binaries for macOS and Linux (the release workflow runs this on a
+# v* tag; the container image is built there too, from the Dockerfile).
+version: 2
+project_name: furcate
+
+builds:
+  - main: ./cmd/furcate
+    binary: furcate
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: ["-s -w -X main.version={{ .Tag }}"]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - formats: [tar.gz]
+    # Named after `uname -s` and `uname -m`, with no version, so
+    # releases/latest/download/furcate_$(uname -s)_$(uname -m).tar.gz works.
+    name_template: >-
+      {{ .ProjectName }}_{{ title .Os }}_{{ if eq .Arch "amd64" }}x86_64{{ else }}{{ .Arch }}{{ end }}
+    files: [LICENSE, README.md]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  disable: true
+
+release:
+  header: |
+    Install: download the archive for your platform below, or
+    `go install github.com/sanidhyasin/furcate/cmd/furcate@{{ .Tag }}` (Go 1.26).
+    The README's [quick start](https://github.com/sanidhyasin/furcate#quick-start) has the rest.
+  footer: |
+    Container image: `ghcr.io/sanidhyasin/furcate:{{ .Tag }}` (linux/amd64, linux/arm64).
+    Checksums are in `checksums.txt`.

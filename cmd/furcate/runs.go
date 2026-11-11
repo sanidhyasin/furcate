@@ -131,7 +131,7 @@ func addRunFlags(fs *flag.FlagSet) runFlags {
 	return runFlags{
 		dsn: dsnFlag(fs), pg: pgFlag(fs),
 		otlp:         fs.String("otlp", envOr("FURCATE_OTLP", "http://localhost:4318"), "collector OTLP/HTTP base URL (env FURCATE_OTLP)"),
-		driver:       fs.String("driver", envOr("FURCATE_DRIVER", "tine"), "sandbox driver (env FURCATE_DRIVER)"),
+		driver:       fs.String("driver", envOr("FURCATE_DRIVER", "docker"), "sandbox driver: docker or tine (env FURCATE_DRIVER)"),
 		noFallbacks:  fs.Bool("no-fallbacks", false, "don't let the API re-serve a refused request with a fallback model"),
 		keep:         fs.Bool("keep", false, "leave sandboxes running after the run, for inspection"),
 		prices:       fs.String("prices", "", "JSON price table on top of the built-in Claude prices"),
@@ -494,7 +494,7 @@ func short(id string) string {
 func runGC(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("gc", flag.ExitOnError)
 	pgDSN := pgFlag(fs)
-	drv := fs.String("driver", envOr("FURCATE_DRIVER", "tine"), "the driver whose checkpoints to delete")
+	drv := fs.String("driver", envOr("FURCATE_DRIVER", "docker"), "the driver whose checkpoints to delete")
 	olderThan := fs.Duration("older-than", 24*time.Hour, "delete unpinned checkpoints older than this")
 	dry := fs.Bool("dry-run", false, "list what would be deleted")
 	fs.Parse(args)

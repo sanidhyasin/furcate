@@ -2,3 +2,4 @@ bin/
 data/
 *.pprof
 demo/site/
+dist/

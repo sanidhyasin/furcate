@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strings"
@@ -47,9 +48,24 @@ Usage:
   furcate dropin run|fork ...      record and fork an unmodified agent (Claude Code)
   furcate serve [-driver docker]   web UI and HTTP API on 127.0.0.1:7070
   furcate snapshot -o dir <run-id>...  the web UI and these runs as static files
+  furcate version                  print the version
 
 Run "furcate <command> -h" for a command's flags.
 `
+
+// version is set in release builds (-ldflags "-X main.version=v0.1.0"); a
+// go install build reports its module version instead.
+var version = ""
+
+func versionString() string {
+	if version != "" {
+		return version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+	return "dev"
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -100,6 +116,8 @@ func main() {
 		err = runServe(ctx, args)
 	case "snapshot":
 		err = runSnapshot(ctx, args)
+	case "version", "-version", "--version":
+		fmt.Println("furcate", versionString())
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:

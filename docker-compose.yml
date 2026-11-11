@@ -1,6 +1,48 @@
-# Local stores for development: ClickHouse for spans, Postgres for run state. The
-# credentials are for these local containers only and match the default DSNs.
+# ClickHouse for spans and Postgres for run state, with credentials for these
+# local containers only that match furcate's default DSNs. Every port is
+# published on 127.0.0.1 only.
+#
+#   docker compose up -d --wait                  the stores (development, tests)
+#   docker compose --profile app up -d --wait    plus the collector and a read-only
+#                                                web UI on http://127.0.0.1:7070
+#
+# The app profile runs the released image (FURCATE_VERSION, default latest), or
+# builds it from this checkout if it can't pull it.
 services:
+  collector:
+    profiles: [app]
+    image: ghcr.io/sanidhyasin/furcate:${FURCATE_VERSION:-latest}
+    build: .
+    command: ["collector", "-http", "0.0.0.0:4318", "-grpc", "0.0.0.0:4317"]
+    environment:
+      FURCATE_CLICKHOUSE: clickhouse://furcate:furcate@clickhouse:9000/furcate
+    ports:
+      - "127.0.0.1:4318:4318" # OTLP/HTTP
+      - "127.0.0.1:4317:4317" # OTLP/gRPC
+    volumes:
+      - collector-wal:/data
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ui:
+    profiles: [app]
+    image: ghcr.io/sanidhyasin/furcate:${FURCATE_VERSION:-latest}
+    build: .
+    command: ["serve", "-listen", "0.0.0.0:7070"]
+    environment:
+      FURCATE_CLICKHOUSE: clickhouse://furcate:furcate@clickhouse:9000/furcate
+      FURCATE_PG: postgres://furcate:furcate@postgres:5432/furcate?sslmode=disable
+    ports:
+      - "127.0.0.1:7070:7070"
+    depends_on:
+      collector:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
   clickhouse:
     image: clickhouse/clickhouse-server:25.8
     ports:
@@ -42,3 +84,4 @@ services:
 volumes:
   clickhouse-data:
   postgres-data:
+  collector-wal:

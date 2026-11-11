@@ -1,0 +1,85 @@
+# Follows the README's quick start on a fresh runner, using only what a
+# release publishes: the binary from the release page, and the stores,
+# collector and web UI from docker-compose.yml with the released image (pulled
+# anonymously, as a user would). Then it checks that traces reach the UI and,
+# with the API key, runs the example agent and forks it (about $0.10).
+#
+# The release workflow calls it after publishing (a release made with the
+# workflow token doesn't trigger other workflows); it can also be run by hand.
+name: quickstart
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release to test (empty for the latest)
+        required: false
+permissions:
+  contents: read
+jobs:
+  quickstart:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Pick the release
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [ -z "$TAG" ]; then TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName); fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.rel.outputs.tag }}
+
+      - name: Install furcate from the release
+        run: |
+          curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/${{ steps.rel.outputs.tag }}/furcate_$(uname -s)_$(uname -m | sed s/aarch64/arm64/).tar.gz" | tar -xz furcate
+          sudo mv furcate /usr/local/bin/
+          furcate version | grep -F "${{ steps.rel.outputs.tag }}"
+
+      - name: Stores, collector and web UI from the released image
+        env:
+          FURCATE_VERSION: ${{ steps.rel.outputs.tag }}
+        run: |
+          docker compose --profile app up -d --wait --no-build
+          curl -fsS http://127.0.0.1:7070/api/info
+
+      - name: Traces reach the UI
+        run: |
+          furcate loadgen -runs 20 -concurrency 4
+          for i in $(seq 60); do
+            n=$(curl -fsS 'http://127.0.0.1:7070/api/runs?since=1h' | jq '.runs | length')
+            [ "$n" -gt 0 ] && break
+            sleep 2
+          done
+          echo "runs in the UI: $n"
+          [ "$n" -gt 0 ]
+
+      - name: Check for the API key
+        id: key
+        env:
+          KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
+          else echo "::notice::No ANTHROPIC_API_KEY secret, so no agent run"; fi
+
+      - name: Run the example agent and fork it
+        if: steps.key.outputs.ok == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          furcate run -task examples/csv-report/task.json | tee run.txt
+          id=$(awk '/^run /{print $2; exit}' run.txt)
+          furcate steps "$id"
+          furcate fork -step 1 -n 2 "$id"
+          curl -fsS "http://127.0.0.1:7070/api/runs/$id/branches" | jq -e '.total == 2'
+          curl -fsS "http://127.0.0.1:7070/api/runs/$id" | jq -e '.trace.spans > 0'
+
+      - name: Logs
+        if: failure()
+        run: docker compose --profile app logs --tail 100

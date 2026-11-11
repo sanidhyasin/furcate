@@ -36,31 +36,75 @@ Opus 5.5, on Docker and on tine, and the numbers below include a bare-metal run
 | 4 | eval cases, portable bundles, `furcate eval run`, GitHub Action | a prompt change in a real repo shows its pass-rate change on the PR | **met**: on [PR #1](https://github.com/sanidhyasin/furcate/pull/1) the Action commented 1/15 on main, 15/15 with the PR's prompt |
 | 5 | drop-in mode for unmodified agents, web UI with "fork from here" | an unmodified Claude Code run forked from any LLM call | **met**: Claude Code 2.1.322 forked from requests 2 and 3 |
 
+## Install
+
+Furcate is one binary. It needs Docker, for its stores and for the `docker`
+sandbox driver; the `tine` driver needs a [tine](https://github.com/sanidhyasin/tine) host.
+
+```bash
+# a release binary, for macOS or Linux on x86_64 or arm64
+curl -fsSL "https://github.com/sanidhyasin/furcate/releases/latest/download/furcate_$(uname -s)_$(uname -m | sed s/aarch64/arm64/).tar.gz" | tar -xz furcate
+sudo mv furcate /usr/local/bin/
+
+# or from source, with Go 1.26
+go install github.com/sanidhyasin/furcate/cmd/furcate@latest
+```
+
+The collector and web UI also come as a container image,
+`ghcr.io/sanidhyasin/furcate` (linux/amd64 and linux/arm64), which the compose
+file below runs.
+
 ## Quick start
 
 ```bash
-docker compose up -d --wait                  # ClickHouse 25.8 and Postgres 17
-go build -o bin/furcate ./cmd/furcate
-./bin/furcate collector                      # OTLP on :4318 (HTTP) and :4317 (gRPC)
+git clone https://github.com/sanidhyasin/furcate && cd furcate   # the compose file and the example agent
+docker compose --profile app up -d --wait    # ClickHouse, Postgres, the collector, and the web UI on http://127.0.0.1:7070
 ```
 
-Then, with `ANTHROPIC_API_KEY` set:
+Then, with `ANTHROPIC_API_KEY` set (the example costs about $0.03 a run):
 
 ```bash
-./bin/furcate run -task examples/csv-report/task.json -driver docker
-./bin/furcate steps <run-id>                 # steps, spans and checkpoints
-./bin/furcate fork -step 5 -n 10 -append-system "Never edit test fixtures." <run-id>
-./bin/furcate branches <run-id>              # pass rate per (step, change), with 95% CIs
-./bin/furcate bisect -n 10 -max-usd 5 <run-id>
-./bin/furcate compare <run-a> <run-b>
-./bin/furcate eval add -run <run-id> -step 5 -name fixture-edit-01
-./bin/furcate eval export fixture-edit-01
-./bin/furcate eval run -variant name=main -variant name=careful,system-file=examples/csv-report/task-careful.json
+furcate run -task examples/csv-report/task.json   # prints the run's id
+furcate steps <run-id>                 # steps, spans and checkpoints
+furcate fork -step 5 -n 10 -append-system "Never edit test fixtures." <run-id>
+furcate branches <run-id>              # pass rate per (step, change), with 95% CIs
+furcate bisect -n 10 -max-usd 5 <run-id>
+furcate compare <run-a> <run-b>
+furcate eval add -run <run-id> -step 5 -name fixture-edit-01
+furcate eval export fixture-edit-01
+furcate eval run -variant name=main -variant name=careful,system-file=examples/csv-report/task-careful.json
 docker build -t furcate-example/claude-code:2.1.322 examples/claude-code
-./bin/furcate dropin run -task examples/claude-code/task.json -driver docker
-./bin/furcate gc -driver docker -older-than 24h   # or: gc <run-id>... for runs you won't fork
-./bin/furcate serve -driver docker           # web UI on http://127.0.0.1:7070
-./bin/furcate snapshot -o site <run-id>...   # the UI and these runs as static files
+furcate dropin run -task examples/claude-code/task.json
+furcate gc -older-than 24h             # or: gc <run-id>... for runs you won't fork
+furcate snapshot -o site <run-id>...   # the UI and these runs as static files
+```
+
+The UI in the compose stack only reads. Forking from it needs the sandboxes,
+so serve it from the host instead: `docker compose stop ui && furcate serve -driver docker`.
+Every release runs this quick start on a fresh machine
+([`quickstart.yml`](.github/workflows/quickstart.yml)): the binary from the
+release page, the stack from the published image, then an agent run and a fork.
+
+### Evals on pull requests
+
+The repository is also a GitHub Action. Given a task spec and eval cases
+exported with `furcate eval export`, it runs the cases under the pull request's
+system prompt and the base branch's, and comments both pass rates and their
+difference with a 95% interval ([an example](https://github.com/sanidhyasin/furcate/pull/1)).
+
+```yaml
+on: pull_request
+jobs:
+  eval:
+    runs-on: ubuntu-24.04
+    permissions: { contents: read, pull-requests: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: sanidhyasin/furcate@v0.1.0
+        with:
+          task: agent/task.json      # the task spec whose system prompt pull requests change
+          cases: evals/cases
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
 
 The web UI lists runs and opens each on its trace: the span tree with a timeline
@@ -330,6 +374,8 @@ action.yml           GitHub Action: eval cases on a pull request
 ## Development
 
 ```bash
+docker compose up -d --wait                  # the stores only
+go build -o bin/furcate ./cmd/furcate && ./bin/furcate collector
 go test -race ./...
 FURCATE_TEST_DOCKER=1 go test ./internal/driver/docker/ ./internal/dropin/
 FURCATE_TEST_PG='postgres://furcate:furcate@localhost:5432/furcate?sslmode=disable' go test ./internal/runstore/
@@ -350,6 +396,10 @@ When changing the code:
 - On macOS, a `-race` test that starts many processes at once can hang in the
   race detector (a child spins in `__tsan::TraceSwitchPartImpl` before exec).
   Kill it and rerun; it isn't a Furcate bug.
+
+To release, push a `v*` tag. The release workflow publishes the binaries
+(GoReleaser) and the image, then runs the quick start against them; run by hand,
+it builds both without publishing.
 
 ## License
 
