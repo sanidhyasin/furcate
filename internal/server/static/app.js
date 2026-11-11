@@ -3,6 +3,9 @@
 'use strict';
 
 const app = document.getElementById('app');
+// A snapshot (furcate snapshot) is this UI plus the API's answers as files, for a
+// static host. Its index.html says so, and api() reads the files instead.
+const STATIC = document.querySelector('meta[name="furcate-static"]') !== null;
 let seq = 0; // bumped on every navigation; async work for an older view drops its result
 let info = { fork_enabled: false, max_n: 100 };
 const payloads = new Map(); // sha256 -> Promise<string>; payloads are immutable
@@ -27,11 +30,46 @@ function h(tag, props, ...kids) {
 }
 
 async function api(path, opts) {
+  if (STATIC) {
+    if (path.startsWith('/api/compare?')) return staticCompare(new URLSearchParams(path.split('?')[1]));
+    path = staticPath(path);
+  }
   const res = await fetch(path, opts);
   const json = (res.headers.get('Content-Type') || '').includes('application/json');
   const body = json ? await res.json() : await res.text();
   if (!res.ok) throw new Error((json && body.error) || `${res.status} ${res.statusText}`);
   return body;
+}
+
+// staticPath maps an API path to its file in a snapshot. Relative, so a snapshot
+// works under any base path.
+function staticPath(path) {
+  const p = path.split('?')[0].replace(/^\//, '');
+  if (p === 'api/runs') return 'api/runs.json';
+  if (p.startsWith('api/payloads/')) return `${p}.txt`;
+  return `${p}.json`;
+}
+
+// staticCompare answers GET /api/compare in a snapshot, which can't hold every
+// pair: both runs' rows, and their end-of-run manifests diffed as the server does.
+async function staticCompare(q) {
+  const load = async id => {
+    const d = await api(`/api/runs/${enc(id)}`);
+    if (!d.run) throw new Error(`run ${id} not found in the run store`);
+    return [d.run, await api(`/api/files/${enc(id)}`)];
+  };
+  const [[a, fa], [b, fb]] = await Promise.all([load(q.get('a')), load(q.get('b'))]);
+  const files = { available: fa != null && fb != null, a: fa ? Object.keys(fa).length : 0, b: fb ? Object.keys(fb).length : 0,
+    same: 0, changed: [], only_a: [], only_b: [] };
+  if (files.available) {
+    for (const p of Object.keys(fa).sort()) {
+      if (!(p in fb)) files.only_a.push(p);
+      else if (fb[p] !== fa[p]) files.changed.push(p);
+      else files.same++;
+    }
+    for (const p of Object.keys(fb).sort()) if (!(p in fa)) files.only_b.push(p);
+  }
+  return { a, b, files };
 }
 
 const enc = encodeURIComponent;
@@ -141,12 +179,12 @@ async function viewRuns(my) {
       h('h1', {}, 'Runs'), count, h('span', { class: 'spacer' }),
       h('input', { type: 'search', placeholder: 'Filter by id, name, parent…', 'aria-label': 'Filter runs', value: prefs.filter,
         oninput: e => { prefs.filter = e.target.value; fill(); } }),
-      h('select', { 'aria-label': 'Time window', onchange: e => { prefs.since = e.target.value; load(); } },
+      STATIC ? null : h('select', { 'aria-label': 'Time window', onchange: e => { prefs.since = e.target.value; load(); } },
         windows.map(([v, t]) => h('option', { value: v, selected: v === prefs.since }, t))),
       h('label', { class: 'check', title: 'Hide traces with no run-store row, such as loadgen runs' },
         h('input', { type: 'checkbox', checked: prefs.trackedOnly, onchange: e => { prefs.trackedOnly = e.target.checked; fill(); } }),
         'Agent runs only'),
-      h('button', { type: 'button', onclick: load }, 'Refresh')),
+      STATIC ? null : h('button', { type: 'button', onclick: load }, 'Refresh')),
     h('div', { class: 'table-wrap' }, h('table', { class: 'runs' },
       h('thead', {}, h('tr', {}, cols.map(([t, cls]) => h('th', { class: cls, scope: 'col' }, t)))),
       tbody))));
@@ -228,8 +266,8 @@ function tracePanel(d, onForked) {
     h('span', { class: 'legend', 'aria-hidden': 'true' },
       ['llm', 'tool', 'agent'].map(k => h('span', {}, h('i', { class: k }), k)), h('span', {}, h('i', { class: 'err' }), 'error')));
   if (!d.trace) {
-    return h('section', { class: 'panel' }, head, h('p', { class: 'empty' },
-      'No spans in the trace store yet. They reach ClickHouse through the collector a few seconds after each step.'));
+    return h('section', { class: 'panel' }, head, h('p', { class: 'empty' }, STATIC ? 'No spans were recorded for this run.'
+      : 'No spans in the trace store yet. They reach ClickHouse through the collector a few seconds after each step.'));
   }
   const total = d.trace.duration_ms || 1;
   const steps = new Map(d.steps.map(s => [s.span_id, s]));
@@ -282,7 +320,8 @@ function spanRow(n, depth, total, d, step, onForked) {
     fork.append(h('button', {
       type: 'button', class: 'btn small', disabled: !info.fork_enabled, onclick: () => toggle('fork'),
       'aria-label': `Fork from here (step ${n.step})`,
-      title: info.fork_enabled ? null : 'Read-only: start furcate serve with -driver to fork',
+      title: info.fork_enabled ? null : STATIC ? 'A snapshot of recorded runs: forking needs furcate serve with a sandbox driver'
+        : 'Read-only: start furcate serve with -driver to fork',
     }, 'Fork from here'));
   } else if (step && step.kind === 'llm' && step.checkpoint && step.checkpoint.deleted) {
     fork.append(h('span', { class: 'muted small', title: 'This checkpoint was garbage-collected' }, 'checkpoint gone'));
@@ -496,9 +535,12 @@ function branchGroup(g, parentId, pick) {
   if (g.done) parts.push(fmt.pct(g.rate), `CI ${fmt.pct(g.lo)}–${fmt.pct(g.hi)}`);
   if (g.errors) parts.push(`${g.errors} error${g.errors === 1 ? '' : 's'}`);
   if (g.running) parts.push(`${g.running} running`);
+  // Eval variants replace the whole system prompt, so their labels start alike: name the variant.
+  const variants = new Set(g.runs.map(r => (r.eval && r.eval.variant) || ''));
+  const variant = variants.size === 1 ? [...variants][0] : '';
   return h('details', { class: 'bgroup' },
     h('summary', {}, h('span', { class: 'bstep' }, `step ${g.step}`),
-      h('code', { class: 'blabel', title: JSON.stringify(g.change) }, g.label), bar,
+      h('code', { class: 'blabel', title: JSON.stringify(g.change) }, variant ? `eval ${variant}: ${g.label}` : g.label), bar,
       h('span', { class: 'bstats' }, parts.join(' · '))),
     h('ul', { class: 'branch-runs' }, g.runs.map(r => {
       const box = h('input', { type: 'checkbox', 'aria-label': `Select ${r.id} to compare` });
@@ -562,6 +604,15 @@ async function viewCompare(my, a, b) {
           : h('p', { class: 'empty' }, 'Both runs ended with identical files.')));
 }
 
+// snapshotNotice says what a snapshot is and where to start.
+function snapshotNotice(i) {
+  return h('div', { class: 'notice', role: 'note' },
+    i.note ? h('span', {}, `${i.note} `) : null,
+    'Every trace, prompt and tool call is browsable; forking needs ',
+    i.home ? h('a', { href: i.home }, 'Furcate') : 'Furcate', ' running with a sandbox driver.',
+    i.featured ? h('span', {}, ' Start with ', h('a', { href: `#/run/${enc(i.featured)}` }, 'a failed run and its forks'), '.') : null);
+}
+
 // ---------- start ----------
 
 window.addEventListener('hashchange', route);
@@ -569,9 +620,11 @@ api('/api/info')
   .then(i => {
     info = i;
     const chip = document.getElementById('mode');
-    chip.textContent = i.fork_enabled ? 'forking enabled' : 'read-only';
-    chip.title = i.fork_enabled ? 'Forks run on this server’s sandbox driver' : 'Started without -driver: browsing only, no forks';
+    chip.textContent = i.fork_enabled ? 'forking enabled' : i.static ? 'snapshot' : 'read-only';
+    chip.title = i.fork_enabled ? 'Forks run on this server’s sandbox driver'
+      : i.static ? 'Recorded runs as static files: browsing only, no forks' : 'Started without -driver: browsing only, no forks';
     chip.hidden = false;
+    if (i.static) app.before(snapshotNotice(i));
   })
   .catch(() => {})
   .finally(route);

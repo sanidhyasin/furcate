@@ -46,6 +46,7 @@ Usage:
   furcate gc [run-id...]           delete unpinned checkpoints: old ones, or these runs
   furcate dropin run|fork ...      record and fork an unmodified agent (Claude Code)
   furcate serve [-driver docker]   web UI and HTTP API on 127.0.0.1:7070
+  furcate snapshot -o dir <run-id>...  the web UI and these runs as static files
 
 Run "furcate <command> -h" for a command's flags.
 `
@@ -97,6 +98,8 @@ func main() {
 		err = runDropIn(ctx, args)
 	case "serve":
 		err = runServe(ctx, args)
+	case "snapshot":
+		err = runSnapshot(ctx, args)
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:

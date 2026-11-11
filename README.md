@@ -52,12 +52,16 @@ docker build -t furcate-example/claude-code:2.1.322 examples/claude-code
 ./bin/furcate dropin run -task examples/claude-code/task.json -driver docker
 ./bin/furcate gc -driver docker -older-than 24h   # or: gc <run-id>... for runs you won't fork
 ./bin/furcate serve -driver docker           # web UI on http://127.0.0.1:7070
+./bin/furcate snapshot -o site <run-id>...   # the UI and these runs as static files
 ```
 
 The web UI lists runs, shows a run's trace as a waterfall with its checkpoints,
 opens any prompt, completion or tool output, forks from any LLM step ("Fork from
 here"), charts each branch group's pass rate with its interval, and compares two
 runs' outcomes, costs and final files. Without `-driver` it is read-only.
+`furcate snapshot` writes the same UI with the given runs and all their branches
+as static files (the API's answers, from its own handlers), which any web host can
+serve as a read-only demo; `make demo-deploy` publishes the runs in `demo/runs.txt`.
 
 Any OpenTelemetry SDK can also send plain traces to `http://localhost:4318/v1/traces`
 (`runs`, `trace`, `stats` work on them); the rewind features need a sandbox driver.
@@ -308,6 +312,7 @@ internal/runstore    runs, steps, checkpoints, eval cases (Postgres; memory for 
 internal/agent       the raw-JSON conversation, the Claude client, sandbox tools
 internal/server      HTTP API and web UI
 examples/            csv-report (Furcate's loop) and claude-code (drop-in)
+demo/                the live demo: its runs and its static host's headers
 action.yml           GitHub Action: eval cases on a pull request
 ```
 

@@ -93,6 +93,40 @@ func runServe(ctx context.Context, args []string) error {
 	return nil
 }
 
+// runSnapshot writes the web UI and the given runs, with all their branches, as
+// static files any web host can serve: a read-only demo with no server behind it.
+func runSnapshot(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("snapshot", flag.ExitOnError)
+	dsn, pg := dsnFlag(fs), pgFlag(fs)
+	out := fs.String("o", "", "directory to write (must be empty or missing)")
+	featured := fs.String("featured", "", "run the banner points to (default: the first given)")
+	note := fs.String("note", "", "banner text: what these runs are")
+	home := fs.String("home", "https://github.com/sanidhyasin/furcate", "where the banner links Furcate's name")
+	fs.Parse(args)
+	if *out == "" || fs.NArg() == 0 {
+		return errors.New("usage: furcate snapshot -o <dir> [-note text] [-featured run-id] [-home url] <run-id>...")
+	}
+	ch, err := store.Open(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer ch.Close()
+	rs, err := runstore.OpenPostgres(ctx, *pg)
+	if err != nil {
+		return err
+	}
+	defer rs.Close()
+	start := time.Now()
+	st, err := server.Snapshot(ctx, server.Config{Traces: ch, Runs: rs}, *out, fs.Args(),
+		server.SnapshotOptions{Featured: *featured, Note: *note, Home: *home})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("wrote %s: %d runs listed, %d in all with their branches, %d payloads, %.1f MB, in %s\n",
+		*out, st.Listed, st.Runs, st.Payloads, float64(st.Bytes)/(1<<20), time.Since(start).Round(time.Millisecond))
+	return nil
+}
+
 // serveForker sends a fork to the engine that can resume the run: the drop-in
 // engine for tasks with a dropin section, the replay engine for the rest.
 type serveForker struct {
