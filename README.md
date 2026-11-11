@@ -8,9 +8,9 @@ different prompt, model or tool output. On top of that: **agent bisect** finds
 the step where a run went wrong, and **eval cases** turn checkpoints of real runs
 into tests that run in CI.
 
-**Live demo: [furcate.sanidhya.work](https://furcate.sanidhya.work)**, the web UI on
-807 real recorded runs (the failed run below, its 410 forks, and the eval cases),
-read-only.
+**Website: [furcate.sanidhya.work](https://furcate.sanidhya.work)**, with a
+[live demo](https://furcate.sanidhya.work/demo/) of the web UI on 807 real recorded
+runs (the failed run below, its 410 forks, and the eval cases), read-only.
 
 ![Furcate's web UI on a failed run: its span tree with a timeline and a checkpoint on every LLM call, and step 6's bash call, which deletes two rows from the test fixture before pytest passes](docs/web-ui.png)
 
@@ -367,7 +367,7 @@ internal/runstore    runs, steps, checkpoints, eval cases (Postgres; memory for 
 internal/agent       the raw-JSON conversation, the Claude client, sandbox tools
 internal/server      HTTP API and web UI
 examples/            csv-report (Furcate's loop) and claude-code (drop-in)
-demo/                the live demo: its runs and its static host's headers
+demo/                the website: landing page, the demo's runs, the host's headers
 action.yml           GitHub Action: eval cases on a pull request
 ```
 

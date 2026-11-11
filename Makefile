@@ -1,7 +1,8 @@
 .PHONY: build test up down collector load bench demo demo-deploy
 
-# The live demo, furcate.sanidhya.work: a snapshot of the runs in demo/runs.txt
-# (and their branches) from the local stores, served as static files by Vercel.
+# furcate.sanidhya.work: the landing page in demo/landing at /, and at /demo/ a
+# snapshot of the runs in demo/runs.txt (and their branches) from the local
+# stores, all static files served by Vercel.
 DEMO_NOTE := Real runs of Claude Opus 5.5 on the csv-report example, recorded on 10 Nov 2026 on Docker and on tine, with their forks and eval cases.
 VERCEL := npx -y vercel@65.3.1 --scope sanidhyasins-projects
 
@@ -28,7 +29,11 @@ bench: build
 
 demo: build
 	rm -rf demo/site
-	./bin/furcate snapshot -o demo/site -note "$(DEMO_NOTE)" $$(cat demo/runs.txt)
+	./bin/furcate snapshot -o demo/site/demo -note "$(DEMO_NOTE)" -home ../ $$(cat demo/runs.txt)
+	cp -R demo/landing/. demo/site/
+	mkdir -p demo/site/img
+	cp docs/web-ui.png demo/site/img/trace.png
+	cp docs/web-ui-branches.png demo/site/img/branches.png
 	cp demo/vercel.json demo/site/
 
 demo-deploy: demo
