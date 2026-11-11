@@ -12,7 +12,7 @@
 <meta property="og:description" content="Trace every step of an agent run, checkpoint its sandbox, then fork, bisect and build evals from any step. Open source.">
 <meta property="og:image" content="https://furcate.sanidhya.work/og.png">
 <meta name="twitter:card" content="summary_large_image">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%234f46e5' stroke-width='2.4' stroke-linecap='round'%3E%3Cpath d='M6 3v7a5 5 0 0 0 5 5h7M6 10v11M15 12l3 3-3 3'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%230a0a0a'/%3E%3Cpath d='M7.5 4.5v5.5a4.5 4.5 0 0 0 4.5 4.5h5.5M7.5 10v9.5M15 11.5l3 3-3 3' fill='none' stroke='%23f5f5f5' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="landing.css">
 </head>
 <body>
@@ -34,13 +34,13 @@
 
 <section class="hero">
   <div class="wrap">
-    <a class="eyebrow" href="https://github.com/sanidhyasin/furcate/releases/tag/v0.1.0"><span class="dot"></span>v0.1.0 · open source · Apache 2.0</a>
+    <a class="eyebrow" href="https://github.com/sanidhyasin/furcate/releases/tag/v0.1.0"><span class="v">v0.1.0</span>Open source, Apache 2.0</a>
     <h1>Rewind an AI agent to any step.<br><span class="grad">Run it again.</span></h1>
     <p class="lede">Furcate records every step of an agent run and checkpoints its sandbox at each model call.
       When a run goes wrong, reopen it at any step, with the same files, processes and conversation,
       and run it again with a different prompt, model or tool output.</p>
     <div class="cta">
-      <a class="btn primary lg" href="demo/#/run/5af1a03e54bec8c6b158db0134357706/trace/0f8e40a14536096e">Explore a real failed run</a>
+      <a class="btn primary lg" href="demo/#/run/5af1a03e54bec8c6b158db0134357706/trace/0f8e40a14536096e">Explore a real failed run <span class="arr">→</span></a>
       <a class="btn lg" href="#install">Install</a>
     </div>
     <p class="fine">The demo is 807 real Claude runs, read-only. No sign-up.</p>
@@ -72,7 +72,7 @@
 
 <section id="how" class="how">
   <div class="wrap">
-    <p class="kicker">How it works</p>
+    <p class="kicker">01 / How it works</p>
     <h2>Trace, checkpoint, fork.</h2>
     <svg class="forkline" viewBox="0 0 960 245" role="img" aria-label="A run's steps along a line, a checkpoint at each model call, and branches forked from step 5, some passing and some failing">
       <line class="main" x1="30" y1="60" x2="930" y2="60"/>
@@ -105,25 +105,25 @@
     </svg>
     <ol class="steps4">
       <li>
-        <span class="n">1</span>
+        <span class="n">STEP 01</span>
         <h3>Trace</h3>
         <p>Every model call and tool call is an OpenTelemetry span. A collector with a write-ahead log stores the spans in ClickHouse, and each prompt, completion and tool output once, by hash.</p>
         <code>OTLP · ClickHouse · Postgres</code>
       </li>
       <li>
-        <span class="n">2</span>
+        <span class="n">STEP 02</span>
         <h3>Checkpoint</h3>
         <p>At each model call the sandbox is snapshotted: a Firecracker VM with its memory and running processes, or a container's files. It's taken while the model is thinking, so the agent never waits for it.</p>
         <code>tine microVMs · Docker</code>
       </li>
       <li>
-        <span class="n">3</span>
+        <span class="n">STEP 03</span>
         <h3>Fork</h3>
         <p>Restore step k into N sandboxes, offline, and resend the recorded request byte for byte with a change: an added instruction, another model, a different tool output. Changes only append, so the prompt cache stays warm.</p>
         <code>furcate fork -step 5 -n 20</code>
       </li>
       <li>
-        <span class="n">4</span>
+        <span class="n">STEP 04</span>
         <h3>Bisect and eval</h3>
         <p>Binary search over steps by pass rate, with intervals, finds the decision that broke the run. Checkpoints of real failures become eval cases that run in CI.</p>
         <code>furcate bisect · furcate eval</code>
@@ -134,7 +134,7 @@
 
 <section id="results" class="results">
   <div class="wrap">
-    <p class="kicker">A real failure</p>
+    <p class="kicker">02 / A real failure</p>
     <h2>Found in three minutes, for $1.77.</h2>
     <p class="sub">The example repo's tests fail on two malformed rows. The right fix is in the code; the tempting one is to delete the rows from the test fixture.
       Told that its test data is "often stale", Claude Opus 5.5 deleted them in 5 of 8 runs. Bisect forked one failed run from each step:</p>
@@ -176,7 +176,7 @@
 
 <section class="numbers">
   <div class="wrap">
-    <p class="kicker">Measured</p>
+    <p class="kicker">03 / Measured</p>
     <h2>Fast enough to fork every step.</h2>
     <div class="stats">
       <div class="stat"><b>53.7k</b><span>spans per second into ClickHouse, with 8 inserts at once; 37.9k sustained for 10 minutes</span></div>
@@ -190,7 +190,7 @@
 
 <section class="with">
   <div class="wrap">
-    <p class="kicker">Works with</p>
+    <p class="kicker">04 / Works with</p>
     <div class="grid3 tight">
       <div class="card"><h3>tine</h3><p>Firecracker microVMs. Checkpoints keep memory and running processes; forks start in milliseconds, offline.</p></div>
       <div class="card"><h3>Docker</h3><p>Runs on a laptop. Checkpoints keep the files; processes restart in forks.</p></div>
@@ -204,7 +204,7 @@
 
 <section id="install" class="install">
   <div class="wrap">
-    <p class="kicker">Install</p>
+    <p class="kicker">05 / Install</p>
     <h2>One binary, a compose file, an API key.</h2>
     <ol class="code-steps">
       <li>
@@ -233,7 +233,7 @@ furcate bisect -n 10 -max-usd 5 &lt;run-id&gt;</pre><button type="button" class=
     <h2>See it on real runs.</h2>
     <p>Open the failed run, step through what the agent did, and look at its 410 forks.</p>
     <div class="cta">
-      <a class="btn primary lg" href="demo/#/run/5af1a03e54bec8c6b158db0134357706/trace/0f8e40a14536096e">Open the live demo</a>
+      <a class="btn primary lg" href="demo/#/run/5af1a03e54bec8c6b158db0134357706/trace/0f8e40a14536096e">Open the live demo <span class="arr">→</span></a>
       <a class="btn lg" href="https://github.com/sanidhyasin/furcate">Read the code</a>
     </div>
   </div>
