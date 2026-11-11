@@ -8,11 +8,19 @@ different prompt, model or tool output. On top of that: **agent bisect** finds
 the step where a run went wrong, and **eval cases** turn checkpoints of real runs
 into tests that run in CI.
 
-![Furcate's web UI on a failed run: the pass rate of its forks from each step, with 95% intervals, and its trace with a checkpoint and "Fork from here" on every LLM call](docs/web-ui.png)
+**Live demo: [furcate.sanidhya.work](https://furcate.sanidhya.work)**, the web UI on
+807 real recorded runs (the failed run below, its 410 forks, and the eval cases),
+read-only.
 
-*The failed `csv-report` run below in the web UI: 410 forks, by step and change. From
-step 5 a quarter pass, from step 7 none, and from step 5 with one added
-sentence of prompt all 20 do.*
+![Furcate's web UI on a failed run: its span tree with a timeline and a checkpoint on every LLM call, and step 6's bash call, which deletes two rows from the test fixture before pytest passes](docs/web-ui.png)
+
+*The failed `csv-report` run below: at step 6 the agent deletes the two bad rows
+from the test fixture instead of fixing the code, and pytest passes.*
+
+![The same run's Branches tab: 410 forks grouped by step and change, each with its pass rate and 95% interval](docs/web-ui-branches.png)
+
+*Its 410 forks. From step 5 a quarter pass and from step 7 none, so the decision is
+made at step 5; from step 5 with one added sentence of prompt, all 20 pass.*
 
 ## Status
 
@@ -55,10 +63,13 @@ docker build -t furcate-example/claude-code:2.1.322 examples/claude-code
 ./bin/furcate snapshot -o site <run-id>...   # the UI and these runs as static files
 ```
 
-The web UI lists runs, shows a run's trace as a waterfall with its checkpoints,
-opens any prompt, completion or tool output, forks from any LLM step ("Fork from
-here"), charts each branch group's pass rate with its interval, and compares two
-runs' outcomes, costs and final files. Without `-driver` it is read-only.
+The web UI lists runs and opens each on its trace: the span tree with a timeline
+on one side and the selected step on the other, an LLM call as the conversation it
+sent and the reply it got (streamed replies included), a tool call as its command
+and output, with the raw payloads a click away. A step with a checkpoint forks from
+there. A run's Branches tab charts each group of forks' pass rate with its
+interval, and any two runs compare by outcome, cost and final files. Without
+`-driver` it is read-only.
 `furcate snapshot` writes the same UI with the given runs and all their branches
 as static files (the API's answers, from its own handlers), which any web host can
 serve as a read-only demo; `make demo-deploy` publishes the runs in `demo/runs.txt`.

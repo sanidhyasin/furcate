@@ -169,6 +169,8 @@ type runItem struct {
 	Tokens      uint64    `json:"tokens"`
 	CostUSD     float64   `json:"cost_usd"`
 	Tracked     bool      `json:"tracked"`
+	TaskID      string    `json:"task_id,omitempty"`
+	Driver      string    `json:"driver,omitempty"`
 	Status      string    `json:"status,omitempty"`
 	Outcome     string    `json:"outcome,omitempty"`
 	ParentRunID string    `json:"parent_run_id,omitempty"`
@@ -247,6 +249,7 @@ func (s *Server) enrich(ctx context.Context, it *runItem) error {
 		return err
 	}
 	it.Tracked, it.Status, it.Outcome, it.Branches = true, run.Status, run.Outcome, len(kids)
+	it.TaskID, it.Driver = run.TaskID, run.Driver
 	it.ParentRunID, it.Eval = run.ParentRunID, toEval(run.Eval)
 	if run.ParentRunID != "" {
 		it.ParentStep = run.ParentStep

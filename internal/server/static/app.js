@@ -9,7 +9,9 @@ const STATIC = document.querySelector('meta[name="furcate-static"]') !== null;
 let seq = 0; // bumped on every navigation; async work for an older view drops its result
 let info = { fork_enabled: false, max_n: 100 };
 const payloads = new Map(); // sha256 -> Promise<string>; payloads are immutable
-const prefs = { since: '7d', filter: '', trackedOnly: false };
+const runs = new Map(); // run id -> Promise<run detail>
+let shownRun = null; // the run on screen, so switching its tabs doesn't refetch it
+const prefs = { since: '7d', filter: '', show: 'runs' };
 
 // ---------- helpers ----------
 
@@ -77,8 +79,11 @@ const safeDecode = s => { try { return decodeURIComponent(s); } catch { return '
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const live = my => my === seq;
 const short = id => (id && id.length > 12 ? id.slice(0, 12) : id || '–');
-const shortCp = id => (id.length > 11 ? id.slice(0, 11) + '…' : id);
+const clamp = (x, lo, hi) => Math.min(Math.max(x, lo), hi);
 const kindCls = k => (['llm', 'tool', 'agent'].includes(k) ? k : 'other');
+const kindLabel = k => ({ llm: 'LLM', tool: 'Tool', agent: 'Agent' }[k] || k || 'span');
+const parseJSON = text => { try { return JSON.parse(text); } catch { return undefined; } };
+const plural = (n, word) => `${fmt.num(n)} ${word}${n === 1 ? '' : 's'}`;
 
 const fmt = {
   dur(ms) {
@@ -101,17 +106,17 @@ function pretty(text) {
   try { return JSON.stringify(JSON.parse(text), null, 2); } catch { return text; }
 }
 
-function badge(text, cls) { return h('span', { class: `badge ${cls}`, text }); }
-
-// resultBadge works for list rows, run rows, branch rows and job branches.
-function resultBadge(r) {
-  if (r.outcome) return badge(r.outcome, r.outcome === 'pass' ? 'pass' : 'fail');
-  if (r.status === 'error') return badge('error', 'error');
-  if (r.status === 'running') return badge('running', 'running');
-  if (r.status) return badge(r.status, 'neutral');
-  if (r.span_status === 'error') return badge('error', 'error');
-  return badge(r.span_status || 'unknown', 'neutral');
+// A run's state as [class, word], for list rows, run rows, branch rows and job branches.
+function stateOf(r) {
+  if (r.outcome) return [r.outcome === 'pass' ? 'pass' : 'fail', r.outcome];
+  if (r.status === 'error') return ['error', 'error'];
+  if (r.status === 'running') return ['running', 'running'];
+  if (r.status) return ['', r.status];
+  if (r.span_status === 'error') return ['error', 'error'];
+  return ['', r.span_status || 'unknown'];
 }
+const status = r => { const [c, t] = stateOf(r); return h('span', { class: `status ${c}` }, h('i'), t); };
+const pill = r => { const [c, t] = stateOf(r); return h('span', { class: `pill ${c}` }, t); };
 
 function errorBox(err) {
   return h('div', { class: 'error-box', role: 'alert' }, h('strong', {}, 'Error: '), err.message || String(err));
@@ -120,72 +125,101 @@ function errorBox(err) {
 function render(my, ...nodes) {
   if (!live(my)) return false;
   app.replaceChildren(...nodes);
+  fitSplit();
   return true;
+}
+
+const page = (...kids) => h('div', { class: 'page' }, ...kids);
+
+function fold(title, body, aside, open) {
+  return h('details', { class: 'fold', open: !!open },
+    h('summary', {}, title, aside ? h('span', { class: 'muted small' }, aside) : null),
+    h('div', { class: 'fold-body' }, body));
+}
+
+function seg(label, options, current, onpick) {
+  const el = h('div', { class: 'seg', role: 'group', 'aria-label': label });
+  for (const [value, text] of options) {
+    el.append(h('button', { type: 'button', 'aria-pressed': String(value === current), onclick: e => {
+      for (const b of el.children) b.setAttribute('aria-pressed', String(b === e.currentTarget));
+      onpick(value);
+    } }, text));
+  }
+  return el;
+}
+
+// The trace's two panes fill the window below the run header on wide screens.
+function fitSplit() {
+  const split = app.querySelector('.split');
+  if (!split) return;
+  if (window.innerWidth <= 900) { split.style.height = ''; return; }
+  const top = split.getBoundingClientRect().top + window.scrollY;
+  split.style.height = `${Math.max(480, window.innerHeight - top - 24)}px`;
 }
 
 // ---------- router ----------
 
 function route() {
   const my = ++seq;
-  const [view, a, b] = location.hash.replace(/^#\/?/, '').split('/').map(safeDecode);
+  const [view, a, b, c] = location.hash.replace(/^#\/?/, '').split('/').map(safeDecode);
   for (const l of document.querySelectorAll('[data-nav]')) {
-    if (l.dataset.nav === (view || 'runs')) l.setAttribute('aria-current', 'page');
+    if (['', 'runs', 'run', 'compare'].includes(view || '')) l.setAttribute('aria-current', 'page');
     else l.removeAttribute('aria-current');
   }
   let p;
   if (!view || view === 'runs') p = viewRuns(my);
-  else if (view === 'run' && a) p = viewRun(my, a);
+  else if (view === 'run' && a) p = viewRun(my, a, b || 'trace', c);
   else if (view === 'compare' && a && b) p = viewCompare(my, a, b);
-  else p = Promise.resolve(render(my, h('p', {}, 'No such page. ', h('a', { href: '#/runs' }, 'Back to runs'))));
-  p.catch(err => render(my, errorBox(err)));
+  else p = Promise.resolve(render(my, page(h('p', {}, 'No such page. ', h('a', { href: '#/runs' }, 'Back to runs')))));
+  p.catch(err => render(my, page(errorBox(err))));
 }
 
 // ---------- runs list ----------
 
 async function viewRuns(my) {
   document.title = 'Runs · Furcate';
+  shownRun = null;
+  const cols = [['Status'], ['Run'], ['Task'], ['Driver', 'opt'], ['Started', 'opt'], ['Duration', 'num'],
+    ['Tokens', 'num opt'], ['Cost', 'num'], ['Branches', 'num opt']];
   const tbody = h('tbody');
-  const count = h('span', { class: 'muted' });
-  let runs = [];
+  const count = h('span', { class: 'count' });
+  let list = [];
 
   const matches = r => {
-    if (prefs.trackedOnly && !r.tracked) return false;
+    if (prefs.show === 'runs' && r.parent_run_id) return false;
     const q = prefs.filter.trim().toLowerCase();
-    return !q || [r.id, r.name, r.service, r.parent_run_id].some(s => s && s.toLowerCase().includes(q));
+    return !q || [r.id, r.name, r.task_id, r.driver, r.parent_run_id].some(s => s && s.toLowerCase().includes(q));
   };
+  const empty = text => h('tr', {}, h('td', { colspan: cols.length, class: 'empty' }, text));
   const fill = () => {
-    const shown = runs.filter(matches);
-    count.textContent = `${shown.length} of ${runs.length}`;
+    const shown = list.filter(matches);
+    count.textContent = shown.length === list.length ? fmt.num(list.length) : `${fmt.num(shown.length)} of ${fmt.num(list.length)}`;
     tbody.replaceChildren(...(shown.length ? shown.map(runRow)
-      : [h('tr', {}, h('td', { colspan: 9, class: 'muted' }, runs.length ? 'No runs match the filter.' : 'No finished runs in this window.'))]));
+      : [empty(list.length ? 'No runs match.' : STATIC ? 'No runs in this snapshot.' : 'No finished runs in this window.')]));
   };
   const load = async () => {
-    tbody.replaceChildren(h('tr', {}, h('td', { colspan: 9, class: 'muted' }, 'Loading…')));
+    tbody.replaceChildren(empty('Loading…'));
     try {
       const data = await api(`/api/runs?since=${enc(prefs.since)}&limit=200`);
       if (!live(my)) return;
-      runs = data.runs;
+      list = data.runs;
       fill();
     } catch (err) {
-      if (live(my)) tbody.replaceChildren(h('tr', {}, h('td', { colspan: 9 }, errorBox(err))));
+      if (live(my)) tbody.replaceChildren(h('tr', {}, h('td', { colspan: cols.length }, errorBox(err))));
     }
   };
 
   const windows = [['1h', 'Last hour'], ['24h', 'Last 24 hours'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days']];
-  const cols = [['Started'], ['Run'], ['Name'], ['Duration', 'num'], ['Spans', 'num opt'], ['Tokens', 'num opt'],
-    ['Cost', 'num'], ['Result'], ['Branches']];
-  render(my, h('section', { class: 'panel' },
-    h('div', { class: 'toolbar' },
+  render(my, page(
+    h('div', { class: 'page-head' },
       h('h1', {}, 'Runs'), count, h('span', { class: 'spacer' }),
-      h('input', { type: 'search', placeholder: 'Filter by id, name, parent…', 'aria-label': 'Filter runs', value: prefs.filter,
+      h('input', { type: 'search', placeholder: 'Filter by id, task, driver…', 'aria-label': 'Filter runs', value: prefs.filter,
         oninput: e => { prefs.filter = e.target.value; fill(); } }),
+      seg('Which runs', [['runs', 'Runs'], ['all', 'With branches']], prefs.show, v => { prefs.show = v; fill(); }),
       STATIC ? null : h('select', { 'aria-label': 'Time window', onchange: e => { prefs.since = e.target.value; load(); } },
         windows.map(([v, t]) => h('option', { value: v, selected: v === prefs.since }, t))),
-      h('label', { class: 'check', title: 'Hide traces with no run-store row, such as loadgen runs' },
-        h('input', { type: 'checkbox', checked: prefs.trackedOnly, onchange: e => { prefs.trackedOnly = e.target.checked; fill(); } }),
-        'Agent runs only'),
-      STATIC ? null : h('button', { type: 'button', onclick: load }, 'Refresh')),
-    h('div', { class: 'table-wrap' }, h('table', { class: 'runs' },
+      STATIC ? null : h('button', { type: 'button', class: 'btn', onclick: load }, 'Refresh')),
+    h('div', { class: 'table-wrap' }, h('table', { class: 'grid' },
       h('thead', {}, h('tr', {}, cols.map(([t, cls]) => h('th', { class: cls, scope: 'col' }, t)))),
       tbody))));
   await load();
@@ -193,191 +227,229 @@ async function viewRuns(my) {
 
 function runRow(r) {
   const href = `#/run/${enc(r.id)}`;
-  const markers = h('span', { class: 'markers' },
-    r.parent_run_id && h('a', { class: 'marker', href: `#/run/${enc(r.parent_run_id)}`,
-      title: `Branch of ${r.parent_run_id} at step ${r.parent_step}: ${r.change_label || ''}` },
-    `↳ ${short(r.parent_run_id)} @${r.parent_step}`),
-    r.branches > 0 && h('span', { class: 'marker fork', title: 'Runs forked from this one' },
-      `${r.branches} branch${r.branches === 1 ? '' : 'es'}`),
-    r.eval && h('span', { class: 'marker', title: `eval case ${r.eval.case} ${r.eval.variant || ''}` }, `eval ${r.eval.case}`));
+  let sub = null;
+  if (r.parent_run_id) {
+    sub = h('span', { class: 'sub' }, 'branch of ', h('a', { href: `#/run/${enc(r.parent_run_id)}`, class: 'mono' }, short(r.parent_run_id)),
+      ` at step ${r.parent_step}`);
+  } else if (r.eval) {
+    sub = h('span', { class: 'sub' }, `eval ${r.eval.case}${r.eval.variant ? ` · ${r.eval.variant}` : ''}`);
+  }
   return h('tr', { class: 'clickable', onclick: e => { if (!e.target.closest('a')) location.hash = href; } },
-    h('td', { class: 'nowrap' }, fmt.time(r.start)),
+    h('td', {}, status(r)),
     h('td', {}, h('a', { href, class: 'mono', title: r.id }, short(r.id))),
-    h('td', { class: 'name', title: r.name }, r.name),
+    h('td', {}, r.task_id || r.name, sub),
+    h('td', { class: 'opt' }, r.driver || '–'),
+    h('td', { class: 'opt nowrap' }, fmt.time(r.start)),
     h('td', { class: 'num' }, fmt.dur(r.duration_ms)),
-    h('td', { class: 'num opt' }, fmt.num(r.spans)),
-    h('td', { class: 'num opt' }, fmt.num(r.tokens)),
+    h('td', { class: 'num opt' }, r.tokens ? fmt.num(r.tokens) : '–'),
     h('td', { class: 'num' }, fmt.cost(r.cost_usd)),
-    h('td', { class: 'nowrap' }, resultBadge(r),
-      r.errors > 0 ? h('span', { class: 'muted small' }, ` ${r.errors} err span${r.errors === 1 ? '' : 's'}`) : null),
-    h('td', {}, markers));
+    h('td', { class: 'num opt' }, r.branches ? fmt.num(r.branches) : '–'));
 }
 
 // ---------- run view ----------
 
-async function viewRun(my, id) {
+function getRun(id, fresh) {
+  if (fresh || !runs.has(id)) {
+    runs.set(id, api(`/api/runs/${enc(id)}`).catch(err => { runs.delete(id); throw err; }));
+  }
+  return runs.get(id);
+}
+
+async function viewRun(my, id, tab, spanId) {
   document.title = `Run ${short(id)} · Furcate`;
-  render(my, h('p', { class: 'muted' }, 'Loading run…'));
-  const d = await api(`/api/runs/${enc(id)}`);
+  if (shownRun !== id) render(my, page(h('p', { class: 'muted' }, 'Loading run…')));
+  const d = await getRun(id, !STATIC && shownRun !== id);
   if (!live(my)) return;
-  const branches = h('section', { class: 'panel', 'aria-label': 'Branches' });
-  const reload = () => loadBranches(my, d, branches);
-  render(my, runHeader(d), d.run ? branches : null, tracePanel(d, reload));
-  if (d.run) reload();
+  shownRun = id;
+  const r = d.run;
+  const tabs = [['trace', 'Trace', d.trace ? d.trace.spans : null]];
+  if (r) tabs.push(['branches', 'Branches', d.branches]);
+  if (r && r.task) tabs.push(['task', 'Task', null]);
+  if (!tabs.some(([k]) => k === tab)) tab = 'trace';
+  const body = tab === 'branches' ? branchesView(my, d) : tab === 'task' ? taskView(r.task) : traceView(d, spanId);
+  render(my, page(runHeader(d),
+    h('nav', { class: 'tabs', 'aria-label': 'Run' }, tabs.map(([k, t, n]) =>
+      h('a', { href: `#/run/${enc(id)}${k === 'trace' ? '' : `/${k}`}`, 'aria-current': k === tab ? 'page' : null },
+        t, n ? h('span', { class: 'n' }, fmt.num(n)) : null))),
+    body));
 }
 
 function runHeader(d) {
   const r = d.run, t = d.trace;
   const root = t && t.roots[0];
-  const facts = h('dl', { class: 'facts' });
-  const add = (k, v) => facts.append(h('div', { class: 'fact' }, h('dt', {}, k), h('dd', {}, v)));
-  add('Run', h('span', { class: 'mono' }, d.id));
-  if (r) { add('Task', r.task_id || '–'); add('Driver', r.driver || '–'); }
-  add('Started', fmt.time(r ? r.started : t.start));
-  add('Duration', fmt.dur(r && r.duration_ms != null ? r.duration_ms : t && t.duration_ms));
-  if (t) add('Spans', `${t.spans} · ${t.totals.llm_calls} LLM · ${t.totals.tool_calls} tool`);
+  const title = (r && r.task_id) || (root && root.name) || 'Run';
+  const meta = h('div', { class: 'meta' });
+  const add = (...kids) => meta.append(h('span', {}, ...kids));
+  if (r && r.driver) add(r.driver);
+  add(fmt.time(r ? r.started : t.start));
+  add(fmt.dur(r && r.duration_ms != null ? r.duration_ms : t && t.duration_ms));
   if (r) {
     const u = r.usage;
-    add('LLM calls', fmt.num(u.llm_calls));
-    add('Tokens', `${fmt.num(u.input_tokens)} in · ${fmt.num(u.cache_read_tokens)} cache read · ${fmt.num(u.output_tokens)} out`);
-    add('Cost', fmt.cost(u.cost_usd));
-    if (r.final_files != null) add('Final files', fmt.num(r.final_files));
+    add(plural(u.llm_calls, 'LLM call'));
+    add(h('span', { title: `${fmt.num(u.input_tokens)} uncached input · ${fmt.num(u.cache_read_tokens)} cache read · ` +
+      `${fmt.num(u.cache_write_tokens)} cache write · ${fmt.num(u.output_tokens)} output` },
+      `${fmt.num(u.input_tokens + u.cache_read_tokens + u.cache_write_tokens)} in · ${fmt.num(u.output_tokens)} out tokens`));
+    add(fmt.cost(u.cost_usd));
+    if (r.final_files != null) add(plural(r.final_files, 'file'));
   } else if (t) {
-    add('Tokens', `${fmt.num(t.totals.tokens_in)} in · ${fmt.num(t.totals.tokens_out)} out`);
-    add('Cost', fmt.cost(t.totals.cost_usd));
+    add(`${fmt.num(t.totals.tokens_in)} in · ${fmt.num(t.totals.tokens_out)} out tokens`);
+    add(fmt.cost(t.totals.cost_usd));
   }
-  const title = (root && root.name) || (r && r.task_id) || 'Run';
-  return h('section', { class: 'panel head' },
-    h('div', { class: 'title' }, h('h1', {}, title), r ? resultBadge(r) : resultBadge({ span_status: root && root.status }),
-      r && r.eval ? h('span', { class: 'marker' }, `eval ${r.eval.case} ${r.eval.variant || ''}`) : null),
-    r && r.parent_run_id ? h('p', {},
-      'Branch of ', h('a', { href: `#/run/${enc(r.parent_run_id)}`, class: 'mono' }, short(r.parent_run_id)),
-      ` at step ${r.parent_step} · change `, h('code', {}, r.change_label || 'none'), ' · ',
-      h('a', { href: `#/compare/${enc(r.parent_run_id)}/${enc(d.id)}` }, 'compare with parent')) : null,
-    r ? null : h('p', { class: 'muted' }, 'Trace only: this run has no row in the run store, so it has no checkpoints to fork.'),
-    r && r.error ? h('p', { class: 'error-msg' }, r.error) : null,
-    facts,
-    r && r.task ? h('details', { class: 'task' }, h('summary', {}, 'Task spec'),
-      h('pre', { class: 'code' }, JSON.stringify(r.task, null, 2))) : null);
+  return h('div', {},
+    h('div', { class: 'crumbs' }, h('a', { href: '#/runs' }, 'Runs'), ' / ', h('span', { class: 'mono' }, d.id)),
+    h('div', { class: 'run-head' },
+      h('h1', {}, title), r ? pill(r) : pill({ span_status: root && root.status }),
+      r && r.eval ? h('span', { class: 'tag' }, `eval ${r.eval.case}${r.eval.variant ? ` · ${r.eval.variant}` : ''}`) : null,
+      h('span', { class: 'spacer' }),
+      r && r.parent_run_id ? h('a', { class: 'btn sm', href: `#/compare/${enc(r.parent_run_id)}/${enc(d.id)}` }, 'Compare with parent') : null),
+    meta,
+    r && r.parent_run_id ? h('div', { class: 'lineage' }, 'Branch of ',
+      h('a', { href: `#/run/${enc(r.parent_run_id)}`, class: 'mono' }, short(r.parent_run_id)),
+      ` from step ${r.parent_step}, with `, h('code', {}, r.change_label || 'no change')) : null,
+    r ? null : h('div', { class: 'lineage muted' }, 'Trace only: this run has no row in the run store, so it has no checkpoints to fork.'),
+    r && r.error ? h('div', { class: 'callout' }, r.error) : null);
 }
 
-function tracePanel(d, onForked) {
-  const head = h('div', { class: 'panel-head trace-head' }, h('h2', {}, 'Trace'), h('span', { class: 'spacer' }),
-    h('span', { class: 'legend', 'aria-hidden': 'true' },
-      ['llm', 'tool', 'agent'].map(k => h('span', {}, h('i', { class: k }), k)), h('span', {}, h('i', { class: 'err' }), 'error')));
+// ---------- trace ----------
+
+function traceView(d, spanId) {
   if (!d.trace) {
-    return h('section', { class: 'panel' }, head, h('p', { class: 'empty' }, STATIC ? 'No spans were recorded for this run.'
-      : 'No spans in the trace store yet. They reach ClickHouse through the collector a few seconds after each step.'));
+    return h('p', { class: 'empty' }, STATIC ? 'No spans were recorded for this run.'
+      : 'No spans in the trace store yet. They reach ClickHouse through the collector a few seconds after each step.');
   }
   const total = d.trace.duration_ms || 1;
   const steps = new Map(d.steps.map(s => [s.span_id, s]));
-  const ticks = [0, 0.25, 0.5, 0.75, 1].map(f => {
-    const t = h('span', { class: 'tick' }, fmt.dur(total * f));
-    t.style.left = `${f * 100}%`;
-    return t;
-  });
-  const rows = [h('div', { class: 'trow thead' },
-    h('div', {}, 'Span'), h('div', { class: 'c-step' }, 'Step'), h('div', { class: 'c-cp' }, 'Checkpoint'),
-    h('div', {}), h('div', { class: 'c-dur' }, 'Duration'), h('div', { class: 'c-wf axis' }, ticks))];
-  const walk = (nodes, depth) => {
-    for (const n of nodes) {
-      rows.push(...spanRow(n, depth, total, d, steps.get(n.span_id), onForked));
-      walk(n.children || [], depth + 1);
-    }
-  };
+  const nodes = [];
+  const walk = (ns, depth) => { for (const n of ns) { nodes.push([n, depth]); walk(n.children || [], depth + 1); } };
   walk(d.trace.roots, 0);
-  const t = d.trace.totals;
-  head.insertBefore(h('span', { class: 'muted' },
-    `${d.trace.spans} spans · ${fmt.dur(d.trace.duration_ms)}${t.errors ? ` · ${t.errors} with error status` : ''}`), head.children[1]);
-  return h('section', { class: 'panel', 'aria-label': 'Trace' }, head, h('div', {}, rows));
-}
 
-// spanRow returns the row plus a slot under it for the span's detail or fork form.
-function spanRow(n, depth, total, d, step, onForked) {
-  const err = n.status === 'error';
-  const slot = h('div', { class: 'slot' });
-  let open = null; // 'detail' | 'fork' | null
-  const row = h('div', { class: 'trow' });
-  const toggle = what => {
-    open = open === what ? null : what;
-    slot.replaceChildren();
-    if (open === 'detail') slot.append(spanDetail(n, step));
-    if (open === 'fork') slot.append(forkForm(n, d, onForked));
-    row.classList.toggle('selected', open !== null);
-    nameBtn.setAttribute('aria-expanded', String(open === 'detail'));
+  const detail = h('div', { class: 'pane', 'aria-live': 'polite' });
+  const rows = [];
+  let current = -1;
+  const select = (i, how) => {
+    if (i < 0 || i >= nodes.length || i === current) return;
+    if (current >= 0) { rows[current].classList.remove('sel'); rows[current].setAttribute('aria-selected', 'false'); }
+    current = i;
+    rows[i].classList.add('sel');
+    rows[i].setAttribute('aria-selected', 'true');
+    const [n] = nodes[i];
+    detail.replaceChildren(spanDetail(n, d, steps.get(n.span_id)));
+    detail.scrollTop = 0;
+    if (how === 'key') rows[i].scrollIntoView({ block: 'nearest' });
+    if (how !== 'init') history.replaceState(null, '', `#/run/${enc(d.id)}/trace/${enc(n.span_id)}`);
   };
-
-  const nameBtn = h('button', { type: 'button', class: 'span-name', title: n.name, 'aria-expanded': 'false', onclick: () => toggle('detail') },
-    h('span', { class: `kind ${kindCls(n.kind)}` }, n.kind),
-    h('span', { class: 'nm' }, n.name),
-    n.model && !n.name.includes(n.model) ? h('span', { class: 'model' }, n.model) : null,
-    err ? h('span', { class: 'errmark', title: n.status_message || 'error', 'aria-label': 'error' }, '!') : null);
-  const label = h('div', { class: 'c-label' }, nameBtn);
-  label.style.paddingLeft = `${6 + depth * 14}px`;
-
-  const fork = h('div', { class: 'c-fork' });
-  if (n.forkable) {
-    fork.append(h('button', {
-      type: 'button', class: 'btn small', disabled: !info.fork_enabled, onclick: () => toggle('fork'),
-      'aria-label': `Fork from here (step ${n.step})`,
-      title: info.fork_enabled ? null : STATIC ? 'A snapshot of recorded runs: forking needs furcate serve with a sandbox driver'
-        : 'Read-only: start furcate serve with -driver to fork',
-    }, 'Fork from here'));
-  } else if (step && step.kind === 'llm' && step.checkpoint && step.checkpoint.deleted) {
-    fork.append(h('span', { class: 'muted small', title: 'This checkpoint was garbage-collected' }, 'checkpoint gone'));
-  }
-
-  const bar = h('div', { class: `bar ${kindCls(n.kind)}${err ? ' err' : ''}`,
-    title: `${n.name}: starts +${fmt.dur(n.offset_ms)}, takes ${fmt.dur(n.duration_ms)}${err ? ', error' : ''}` });
-  const left = Math.min(Math.max((n.offset_ms / total) * 100, 0), 100);
-  bar.style.left = `${left}%`;
-  bar.style.width = `${Math.min(Math.max((n.duration_ms / total) * 100, 0.15), 100 - left)}%`;
-
-  row.append(label,
-    h('div', { class: 'c-step num' }, n.step ? String(n.step) : ''),
-    h('div', { class: 'c-cp mono', title: n.checkpoint_id || '' }, n.checkpoint_id ? shortCp(n.checkpoint_id) : ''),
-    fork,
-    h('div', { class: 'c-dur num' }, fmt.dur(n.duration_ms)),
-    h('div', { class: 'c-wf' }, bar));
-  row.addEventListener('click', e => { if (!e.target.closest('button, a, input, textarea, select')) toggle('detail'); });
-  return [row, slot];
+  nodes.forEach(([n, depth], i) => {
+    const err = n.status === 'error';
+    const left = clamp((n.offset_ms / total) * 100, 0, 100);
+    const bar = h('span', { class: `bar ${kindCls(n.kind)}${err ? ' err' : ''}` });
+    bar.style.left = `${left}%`;
+    bar.style.width = `${clamp((n.duration_ms / total) * 100, 0.4, 100 - left)}%`;
+    const name = h('div', { class: 'tname' },
+      h('span', { class: `kdot ${kindCls(n.kind)}`, title: kindLabel(n.kind) }),
+      h('span', { class: 'nm', title: n.name }, n.name),
+      n.step ? h('span', { class: 'stepn', title: `step ${n.step}` }, `#${n.step}`) : null,
+      n.checkpoint_id ? h('span', { class: 'cpmark', title: `checkpoint ${n.checkpoint_id}` }, '◆') : null,
+      err ? h('span', { class: 'errmark', title: n.status_message || 'error' }, '!') : null);
+    name.style.paddingLeft = `${depth * 16}px`;
+    rows.push(h('div', { class: 'trow', role: 'option', 'aria-selected': 'false', onclick: () => select(i, 'click') },
+      name,
+      h('div', { class: 'tl', title: `starts at +${fmt.dur(n.offset_ms)}, takes ${fmt.dur(n.duration_ms)}` }, bar),
+      h('div', { class: 'tdur' }, fmt.dur(n.duration_ms))));
+  });
+  const tree = h('div', { class: 'pane tree', role: 'listbox', tabindex: '0', 'aria-label': 'Spans (arrow keys move)',
+    onkeydown: e => {
+      if (e.key === 'ArrowDown' || e.key === 'j') { select(current + 1, 'key'); e.preventDefault(); }
+      if (e.key === 'ArrowUp' || e.key === 'k') { select(current - 1, 'key'); e.preventDefault(); }
+    } },
+    h('div', { class: 'tree-head' }, h('span', {}, plural(d.trace.spans, 'span')), h('span', {}, 'Timeline'),
+      h('span', { class: 'num' }, fmt.dur(d.trace.duration_ms))),
+    rows);
+  const at = nodes.findIndex(([n]) => n.span_id === spanId);
+  select(at >= 0 ? at : 0, 'init');
+  if (at > 0) requestAnimationFrame(() => rows[at].scrollIntoView({ block: 'nearest' }));
+  return h('div', { class: 'split' }, tree, detail);
 }
 
 const PAYLOAD_LABELS = {
   'furcate.llm.request': 'Request', 'furcate.llm.response': 'Response',
-  'gen_ai.tool.call.arguments': 'Tool args', 'gen_ai.tool.call.result': 'Tool result',
+  'gen_ai.tool.call.arguments': 'Tool input', 'gen_ai.tool.call.result': 'Tool output',
   'gen_ai.input.messages': 'Input messages', 'gen_ai.output.messages': 'Output messages',
   'gen_ai.system_instructions': 'System', 'gen_ai.tool.definitions': 'Tool definitions',
   'gen_ai.prompt': 'Prompt', 'gen_ai.completion': 'Completion',
 };
 const payloadOrder = k => { const i = Object.keys(PAYLOAD_LABELS).indexOf(k); return i < 0 ? 99 : i; };
 
-function spanDetail(n, step) {
-  const facts = h('dl', { class: 'facts compact' });
-  const add = (k, v) => { if (v != null && v !== '') facts.append(h('div', { class: 'fact' }, h('dt', {}, k), h('dd', {}, v))); };
-  add('Span', h('span', { class: 'mono' }, n.span_id));
-  add('Kind', n.kind);
-  add('Model', n.model);
-  add('Start', `+${fmt.dur(n.offset_ms)}`);
-  add('Duration', fmt.dur(n.duration_ms));
-  if (n.tokens_in || n.tokens_out) add('Tokens', `${fmt.num(n.tokens_in)} in · ${fmt.num(n.tokens_out)} out`);
-  if (n.cost_usd) add('Cost', fmt.cost(n.cost_usd));
-  add('Status', n.status);
-  if (n.step) add('Step', String(n.step));
+function spanDetail(n, d, step) {
+  const kind = kindCls(n.kind);
+  const keys = Object.keys(n.payloads || {}).sort((a, b) => payloadOrder(a) - payloadOrder(b) || a.localeCompare(b));
+  const formatted = formattedView(n);
+
+  const forkSlot = h('div', {});
+  let action = null;
+  if (n.forkable) {
+    action = h('button', {
+      type: 'button', class: 'btn sm primary', disabled: !info.fork_enabled,
+      title: info.fork_enabled ? `Restore ${n.checkpoint_id} and run continuations from here`
+        : STATIC ? 'This is a snapshot of recorded runs: forking needs furcate serve with a sandbox driver'
+          : 'Read-only: start furcate serve with -driver to fork',
+      onclick: () => forkSlot.replaceChildren(...(forkSlot.firstChild ? [] : [forkForm(n, d)])),
+    }, `Fork from step ${n.step}`);
+  } else if (step && step.kind === 'llm' && step.checkpoint && step.checkpoint.deleted) {
+    action = h('span', { class: 'muted small' }, 'checkpoint garbage-collected');
+  }
+
+  const meta = h('div', { class: 'meta' });
+  const add = (...kids) => meta.append(h('span', {}, ...kids));
+  add(fmt.dur(n.duration_ms));
+  add(`at +${fmt.dur(n.offset_ms)}`);
+  if (n.step) add(`step ${n.step}`);
+  if (n.tokens_in || n.tokens_out) add(`${fmt.num(n.tokens_in)} in · ${fmt.num(n.tokens_out)} out tokens`);
+  if (n.cost_usd) add(fmt.cost(n.cost_usd));
   if (n.checkpoint_id) {
     const cp = step && step.checkpoint;
-    add('Checkpoint', h('span', {}, h('span', { class: 'mono' }, n.checkpoint_id),
-      cp ? ` · ${cp.driver} level ${cp.level}${cp.size_bytes ? ` · ${fmt.bytes(cp.size_bytes)}` : ''}` +
-        `${cp.pinned ? ' · pinned' : ''}${cp.deleted ? ' · garbage-collected' : ''}` : ''));
+    add(h('span', { title: cp ? `${cp.driver} checkpoint, level ${cp.level}${cp.size_bytes ? `, ${fmt.bytes(cp.size_bytes)}` : ''}` +
+      `${cp.pinned ? ', pinned' : ''}${cp.deleted ? ', garbage-collected' : ''}` : 'checkpoint' },
+    h('span', { class: 'cpmark' }, '◆ '), h('span', { class: 'mono' }, n.checkpoint_id)));
   }
-  const keys = Object.keys(n.payloads || {}).sort((a, b) => payloadOrder(a) - payloadOrder(b) || a.localeCompare(b));
+
+  const body = h('div', {});
+  const showRaw = () => body.replaceChildren(keys.length ? payloadViewer(n.payloads, keys) : h('p', { class: 'muted small' }, 'No payloads recorded on this span.'));
+  const kids = [
+    h('div', { class: 'd-head' },
+      h('h2', {}, h('span', { class: `kind ${kind}` }, kindLabel(n.kind)), n.name),
+      h('span', { class: 'spacer' }), action),
+    meta,
+    n.status === 'error' && n.status_message ? h('div', { class: 'callout' }, n.status_message) : null,
+    n.orphan ? h('p', { class: 'muted small' }, 'This span’s parent never arrived.') : null,
+    forkSlot,
+  ];
+  if (d.run && d.trace.roots[0] === n) kids.push(runSummary(d));
+  if (formatted && keys.length) {
+    kids.push(h('div', { class: 'd-tools' }, seg('Payload view', [['formatted', 'Formatted'], ['raw', 'Raw']], 'formatted',
+      v => (v === 'raw' ? showRaw() : body.replaceChildren(formatted)))));
+    body.append(formatted);
+  } else if (keys.length) {
+    kids.push(h('div', { class: 'sec' }, h('div', { class: 'sec-title' }, 'Payloads'), body));
+    showRaw();
+  }
+  if (formatted) kids.push(body);
+
   const attrs = Object.entries(n.attributes || {}).sort(([a], [b]) => a.localeCompare(b));
-  return h('div', { class: 'detail' }, facts,
-    n.status_message ? h('p', { class: 'error-msg' }, n.status_message) : null,
-    n.orphan ? h('p', { class: 'muted' }, 'This span’s parent never arrived.') : null,
-    keys.length ? payloadViewer(n.payloads, keys) : h('p', { class: 'muted small' }, 'No payloads recorded on this span.'),
-    attrs.length ? h('details', { class: 'attrs' }, h('summary', {}, `Attributes (${attrs.length})`),
-      h('table', { class: 'kv' }, h('tbody', {}, attrs.map(([k, v]) => h('tr', {}, h('th', { class: 'mono' }, k), h('td', { class: 'mono' }, v)))))) : null);
+  kids.push(h('div', { class: 'sec' }, fold(`Attributes (${attrs.length + 1})`,
+    h('table', { class: 'attrs' }, h('tbody', {}, h('tr', {}, h('th', {}, 'span_id'), h('td', {}, n.span_id)),
+      attrs.map(([k, v]) => h('tr', {}, h('th', {}, k), h('td', {}, v))))))));
+  return h('div', { class: 'detail' }, kids);
+}
+
+function runSummary(d) {
+  const r = d.run, t = d.trace.totals;
+  return h('div', { class: 'sec' }, h('div', { class: 'sec-title' }, 'Run'),
+    h('dl', { class: 'kv' },
+      h('dt', {}, 'Outcome'), h('dd', {}, status(r)),
+      h('dt', {}, 'Steps'), h('dd', {}, `${plural(t.llm_calls, 'LLM call')}, ${plural(t.tool_calls, 'tool call')}`),
+      h('dt', {}, 'Branches'), h('dd', {}, d.branches ? h('a', { href: `#/run/${enc(d.id)}/branches` }, plural(d.branches, 'run')) : 'none'),
+      h('dt', {}, 'Task'), h('dd', {}, r.task ? h('a', { href: `#/run/${enc(d.id)}/task` }, r.task_id) : r.task_id)),
+    h('p', { class: 'muted small' }, 'Select a step on the left (or use the arrow keys) to see its prompt, response or tool output.'));
 }
 
 function loadPayload(hash) {
@@ -387,11 +459,172 @@ function loadPayload(hash) {
   return payloads.get(hash);
 }
 
+// formattedView shows an LLM call as a conversation and a tool call as a command
+// and its output, or returns null for spans it doesn't know how to read.
+function formattedView(n) {
+  const p = n.payloads || {};
+  if (p['furcate.llm.request'] || p['furcate.llm.response']) {
+    return sections([['Input', p['furcate.llm.request'], requestView],
+      ['Output', p['furcate.llm.response'], responseView, text => parseJSON(text) ?? sseMessage(text)]]);
+  }
+  if (p['gen_ai.tool.call.arguments'] || p['gen_ai.tool.call.result']) {
+    const name = (n.attributes && n.attributes['gen_ai.tool.name']) || n.name.replace(/^execute_tool /, '');
+    return sections([
+      ['Input', p['gen_ai.tool.call.arguments'], v => callView(name, v)],
+      ['Output', p['gen_ai.tool.call.result'], v => resultView(typeof v === 'string' ? v : JSON.stringify(v, null, 2), n.status === 'error')],
+    ], true);
+  }
+  return null;
+}
+
+// sseMessage rebuilds the final message from a streamed Messages response (the
+// drop-in proxy records the stream as it went by), or returns undefined.
+function sseMessage(text) {
+  if (!/^data:/m.test(text)) return undefined;
+  let msg = null;
+  const blocks = [];
+  for (const line of text.split('\n')) {
+    if (!line.startsWith('data:')) continue;
+    const ev = parseJSON(line.slice(5).trim());
+    if (!ev) continue;
+    if (ev.type === 'message_start') msg = { ...ev.message, content: [] };
+    else if (ev.type === 'content_block_start') blocks[ev.index] = { ...ev.content_block, partial: '' };
+    else if (ev.type === 'content_block_delta' && blocks[ev.index]) {
+      const b = blocks[ev.index], d = ev.delta || {};
+      if (d.type === 'text_delta') b.text = (b.text || '') + d.text;
+      else if (d.type === 'thinking_delta') b.thinking = (b.thinking || '') + d.thinking;
+      else if (d.type === 'input_json_delta') b.partial += d.partial_json;
+    } else if (ev.type === 'message_delta' && msg) {
+      Object.assign(msg, ev.delta || {});
+      msg.usage = { ...(msg.usage || {}), ...(ev.usage || {}) };
+    }
+  }
+  if (!msg) return undefined;
+  msg.content = blocks.filter(Boolean).map(({ partial, ...b }) => (partial ? { ...b, input: parseJSON(partial) ?? partial } : b));
+  return msg;
+}
+
+// sections loads each payload and renders it; anything it can't read shows as text.
+function sections(parts, keepText) {
+  return h('div', {}, parts.map(([title, hash, view, read = parseJSON]) => {
+    const el = h('div', {}, h('p', { class: 'muted small' }, hash ? 'Loading…' : 'Not recorded.'));
+    if (hash) {
+      loadPayload(hash).then(text => {
+        const v = read(text);
+        let node = null;
+        try { node = v !== undefined && (typeof v === 'object' || keepText) ? view(v) : keepText ? view(text) : null; } catch { node = null; }
+        el.replaceChildren(node || h('pre', { class: 'code' }, pretty(text)));
+      }, err => el.replaceChildren(h('p', { class: 'error-msg' }, `Could not load this payload: ${err.message}`)));
+    }
+    return h('div', { class: 'sec' }, h('div', { class: 'sec-title' }, title), el);
+  }));
+}
+
+function requestView(req) {
+  if (!req || !Array.isArray(req.messages)) return null;
+  const out = [];
+  const facts = [req.model, req.max_tokens && `max ${fmt.num(req.max_tokens)} tokens`,
+    req.output_config && req.output_config.effort && `effort ${req.output_config.effort}`,
+    Array.isArray(req.tools) && req.tools.length && `tools: ${req.tools.map(t => t.name).join(', ')}`].filter(Boolean);
+  if (facts.length) out.push(h('div', { class: 'usage' }, facts.join(' · ')));
+  const sys = typeof req.system === 'string' ? req.system
+    : Array.isArray(req.system) ? req.system.map(b => b.text || '').join('\n\n') : '';
+  if (sys) out.push(fold('System prompt', h('div', { class: 'text' }, sys), `${fmt.num(sys.length)} characters`));
+  const msgs = req.messages;
+  const keep = Math.min(msgs.length, 1); // the newest turn is what this call adds; the step before shows the rest
+  const early = msgs.slice(0, msgs.length - keep);
+  if (early.length) out.push(fold(`${plural(early.length, 'earlier message')}`, early.map(messageView)));
+  out.push(...msgs.slice(msgs.length - keep).map(messageView));
+  return h('div', {}, out);
+}
+
+function responseView(resp) {
+  if (!resp || !Array.isArray(resp.content)) return null;
+  const u = resp.usage || {};
+  const usage = [resp.stop_reason && `stop: ${resp.stop_reason}`, u.input_tokens != null && `${fmt.num(u.input_tokens)} input`,
+    u.cache_read_input_tokens && `${fmt.num(u.cache_read_input_tokens)} cache read`,
+    u.cache_creation_input_tokens && `${fmt.num(u.cache_creation_input_tokens)} cache write`,
+    u.output_tokens != null && `${fmt.num(u.output_tokens)} output tokens`].filter(Boolean).join(' · ');
+  return h('div', {},
+    h('div', { class: 'msg assistant' }, h('div', { class: 'msg-head' }, 'assistant', resp.model ? h('span', { class: 'muted' }, resp.model) : null),
+      h('div', { class: 'msg-body' }, blocksView(resp.content))),
+    usage ? h('div', { class: 'usage' }, usage) : null);
+}
+
+function messageView(m) {
+  const blocks = typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : Array.isArray(m.content) ? m.content : [];
+  // A user turn that only carries tool results reads better labelled as such.
+  const label = m.role === 'user' && blocks.length && blocks.every(b => b.type === 'tool_result') ? 'tool result' : m.role;
+  return h('div', { class: `msg ${m.role}` }, h('div', { class: 'msg-head' }, label), h('div', { class: 'msg-body' }, blocksView(blocks)));
+}
+
+// blocksView renders content blocks, folding a run of thinking blocks without
+// text (the API returned only their signatures) into one line.
+function blocksView(blocks) {
+  const out = [];
+  let quiet = 0;
+  const flush = () => {
+    if (quiet) out.push(h('div', { class: 'thinking' }, `Thinking${quiet > 1 ? ` ×${quiet}` : ''} (no text recorded)`));
+    quiet = 0;
+  };
+  for (const b of blocks) {
+    if (b.type === 'thinking' && !b.thinking) { quiet++; continue; }
+    flush();
+    out.push(blockView(b));
+  }
+  flush();
+  return out;
+}
+
+function blockView(b) {
+  switch (b.type) {
+    case 'text': return h('div', { class: 'text' }, b.text || '');
+    case 'thinking': return b.thinking ? fold('Thinking', h('div', { class: 'text' }, b.thinking)) : h('div', { class: 'thinking' }, 'Thinking (no text recorded)');
+    case 'redacted_thinking': return h('div', { class: 'thinking' }, 'Redacted thinking');
+    case 'tool_use': return callView(b.name, b.input);
+    case 'tool_result': return resultView(b.content, b.is_error, 8);
+    default: return h('pre', { class: 'code' }, JSON.stringify(b, null, 2));
+  }
+}
+
+// clipped shows the first lines of a long text, with a button for the rest, so a
+// file dump doesn't push the rest of a conversation off screen.
+function clipped(text, lines = 14) {
+  const all = (text || '').split('\n');
+  if (all.length <= lines + 4) return h('pre', {}, text || '');
+  const pre = h('pre', {}, all.slice(0, lines).join('\n'));
+  const more = h('button', { type: 'button', class: 'more', onclick: () => { pre.textContent = text; more.remove(); } },
+    `Show ${fmt.num(all.length - lines)} more lines`);
+  return h('div', {}, pre, more);
+}
+
+function callView(name, input) {
+  let body;
+  if (input && typeof input.command === 'string' && Object.keys(input).length === 1) {
+    body = clipped(`$ ${input.command}`);
+  } else if (input && typeof input.path === 'string' && typeof input.content === 'string') {
+    body = h('div', {}, h('div', { class: 'call-sub mono' }, input.path), clipped(input.content));
+  } else {
+    body = clipped(typeof input === 'string' ? input : JSON.stringify(input, null, 2));
+  }
+  return h('div', { class: 'call' }, h('div', { class: 'call-head' }, '→', h('b', {}, name || 'tool')), body);
+}
+
+function resultView(content, isError, lines) {
+  const text = typeof content === 'string' ? content
+    : Array.isArray(content) ? content.map(c => (c.type === 'text' ? c.text : `[${c.type}]`)).join('\n') : JSON.stringify(content, null, 2);
+  const exit = /^exit code (\d+)/.exec(text || '');
+  const failed = isError || (exit && exit[1] !== '0');
+  return h('div', { class: `result${failed ? ' err' : ''}` },
+    h('div', { class: 'result-head' }, '← result', exit ? h('span', {}, `exit ${exit[1]}`) : null, isError ? h('span', {}, 'error') : null),
+    clipped(text, lines));
+}
+
 function payloadViewer(hashes, keys) {
-  const tabs = h('div', { class: 'tabs', role: 'tablist', 'aria-label': 'Payloads' });
   const meta = h('span', { class: 'muted small' });
-  const pre = h('pre', { class: 'code', tabindex: '0', role: 'tabpanel' });
+  const pre = h('pre', { class: 'code', tabindex: '0' });
   let current = null;
+  const tabs = h('div', { class: 'seg', role: 'tablist', 'aria-label': 'Payloads' });
   const show = async key => {
     current = key;
     for (const b of tabs.children) b.setAttribute('aria-selected', String(b.dataset.key === key));
@@ -408,20 +641,20 @@ function payloadViewer(hashes, keys) {
     }
   };
   for (const k of keys) {
-    tabs.append(h('button', { type: 'button', role: 'tab', class: 'tab', 'data-key': k, title: k, onclick: () => show(k) },
+    tabs.append(h('button', { type: 'button', role: 'tab', 'data-key': k, 'aria-selected': 'false', title: k, onclick: () => show(k) },
       PAYLOAD_LABELS[k] || k));
   }
-  const copy = h('button', { type: 'button', class: 'btn small', onclick: async () => {
+  const copy = h('button', { type: 'button', class: 'btn sm', onclick: async () => {
     try { await navigator.clipboard.writeText(pre.textContent); copy.textContent = 'Copied'; } catch { copy.textContent = 'Copy failed'; }
     setTimeout(() => { copy.textContent = 'Copy'; }, 1200);
   } }, 'Copy');
   show(keys[0]);
-  return h('div', { class: 'payloads' }, h('div', { class: 'payload-bar' }, tabs, h('span', { class: 'spacer' }), meta, copy), pre);
+  return h('div', {}, h('div', { class: 'payload-bar' }, tabs, h('span', { class: 'spacer' }), meta, copy), pre);
 }
 
 // ---------- fork ----------
 
-function forkForm(n, d, onForked) {
+function forkForm(n, d) {
   const count = h('input', { type: 'number', min: 1, max: info.max_n, value: 5, required: true });
   const model = h('input', { type: 'text', spellcheck: 'false', placeholder: `unchanged (${n.model || 'parent model'})` });
   const sys = h('textarea', { rows: 2, placeholder: 'e.g. Never delete test fixtures.' });
@@ -444,7 +677,7 @@ function forkForm(n, d, onForked) {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ step: n.step, n: Number(count.value), change }),
       });
-      await pollJob(job, status, onForked);
+      await pollJob(job, status, d.id);
     } catch (err) {
       status.replaceChildren(h('span', { class: 'error-msg' }, err.message));
     }
@@ -452,43 +685,50 @@ function forkForm(n, d, onForked) {
   };
 
   return h('form', { class: 'fork-form', onsubmit: onSubmit },
-    h('h3', {}, `Fork from step ${n.step}`, h('span', { class: 'muted' }, ` · restores ${n.checkpoint_id} and resends this request`)),
+    h('h3', {}, `Fork from step ${n.step}`, h('span', { class: 'muted small' }, ` · restores ${n.checkpoint_id} and resends this request`)),
     h('label', {}, 'Continuations (N)', count),
     h('label', {}, 'Model', model),
-    h('label', { class: 'wide' }, 'Append system instruction', sys),
+    h('label', { class: 'wide' }, 'Append a system instruction', sys),
     h('div', { class: 'wide' }, h('label', { class: 'check' }, override, 'Override the last tool output'), toolOut),
     h('div', { class: 'wide row' }, submit, h('span', { class: 'muted small' }, 'Each branch is a new run; the result is a pass rate with a 95% CI.')),
     status);
 }
 
-async function pollJob(job, status, onForked) {
+async function pollJob(job, status, runId) {
   const my = seq;
   for (;;) {
-    status.replaceChildren(jobSummary(job));
+    status.replaceChildren(jobSummary(job, runId));
     if (job.status !== 'running' || !live(my)) break;
     await sleep(1500);
     job = await api(`/api/jobs/${enc(job.id)}`);
   }
-  if (job.status === 'done' && live(my)) onForked();
+  if (job.status === 'done') runs.delete(runId); // its branch count changed
 }
 
-function jobSummary(j) {
+function jobSummary(j, runId) {
   if (j.status === 'running') {
     return h('span', {}, h('span', { class: 'spinner', 'aria-hidden': 'true' }),
-      ` ${j.n} branch${j.n === 1 ? '' : 'es'} from step ${j.step} running · ${fmt.dur(j.elapsed_ms)} · job ${j.id}`);
+      ` ${plural(j.n, 'branch')} from step ${j.step} running · ${fmt.dur(j.elapsed_ms)} · job ${j.id}`);
   }
   if (j.status === 'error') return h('span', { class: 'error-msg' }, `Fork failed: ${j.error}`);
   const r = j.result;
   return h('div', {},
     h('div', {}, h('strong', {}, `Passed ${r.passes} of ${r.done}`),
       r.done ? ` · ${fmt.pct(r.rate)} · 95% CI ${fmt.pct(r.lo)}–${fmt.pct(r.hi)}` : '',
-      ` · ${fmt.cost(r.usage.cost_usd)} · ${fmt.dur(j.elapsed_ms)}`, r.errors ? ` · ${r.errors} errored` : ''),
-    h('ul', { class: 'branch-list' }, r.branches.map(b => h('li', {},
-      b.run_id ? h('a', { href: `#/run/${enc(b.run_id)}`, class: 'mono' }, short(b.run_id)) : '–', ' ', resultBadge(b),
+      ` · ${fmt.cost(r.usage.cost_usd)} · ${fmt.dur(j.elapsed_ms)}`, r.errors ? ` · ${r.errors} errored` : '',
+      ' · ', h('a', { href: `#/run/${enc(runId)}/branches` }, 'see all branches')),
+    h('ul', {}, r.branches.map(b => h('li', {},
+      b.run_id ? h('a', { href: `#/run/${enc(b.run_id)}`, class: 'mono' }, short(b.run_id)) : '–', ' ', status(b),
       b.error ? h('span', { class: 'error-msg small' }, ` ${b.error}`) : null))));
 }
 
 // ---------- branches ----------
+
+function branchesView(my, d) {
+  const panel = h('div', {}, h('p', { class: 'muted' }, 'Loading branches…'));
+  loadBranches(my, d, panel);
+  return panel;
+}
 
 async function loadBranches(my, d, panel) {
   let data;
@@ -499,55 +739,64 @@ async function loadBranches(my, d, panel) {
     return;
   }
   if (!live(my)) return;
-  const picked = new Set();
-  const compare = h('button', { type: 'button', class: 'btn small', disabled: true,
-    onclick: () => { const [a, b] = picked; location.hash = `#/compare/${enc(a)}/${enc(b)}`; } }, 'Compare 2 selected');
-  const head = h('div', { class: 'panel-head' }, h('h2', {}, 'Branches'),
-    h('span', { class: 'muted' }, data.total ? `${data.total} run${data.total === 1 ? '' : 's'} forked from this one, by step and change` : ''),
-    h('span', { class: 'spacer' }), data.total > 1 ? compare : null);
   if (!data.total) {
-    panel.replaceChildren(head, h('p', { class: 'empty' }, info.fork_enabled
-      ? 'No branches yet. Use “Fork from here” on an LLM step to run N continuations with a change.'
-      : 'No branches yet. Fork with furcate fork, or start furcate serve with -driver to fork from here.'));
+    panel.replaceChildren(h('p', { class: 'empty' }, info.fork_enabled
+      ? 'No branches yet. Select an LLM step in the trace and fork from it.'
+      : 'No branches yet. Fork with furcate fork or furcate bisect, or start furcate serve with -driver to fork from the trace.'));
     return;
   }
+  const picked = new Set();
+  const compare = h('button', { type: 'button', class: 'btn sm', disabled: true,
+    onclick: () => { const [a, b] = picked; location.hash = `#/compare/${enc(a)}/${enc(b)}`; } }, 'Compare 2 selected');
   const pick = (box, id) => {
     if (box.checked && picked.size >= 2) { box.checked = false; return; }
     if (box.checked) picked.add(id); else picked.delete(id);
     compare.disabled = picked.size !== 2;
   };
-  panel.replaceChildren(head, h('div', { class: 'groups' }, data.groups.map(g => branchGroup(g, d.id, pick))));
+  panel.replaceChildren(
+    h('div', { class: 'page-head' },
+      h('span', { class: 'muted' }, `${plural(data.total, 'run')} forked from this one, grouped by step and change. Open a group to see its runs.`),
+      h('span', { class: 'spacer' }), data.total > 1 ? compare : null),
+    h('div', { class: 'bgroups' },
+      h('div', { class: 'bhead' }, h('span', {}, 'Step'), h('span', {}, 'Change'), h('span', {}, 'Pass rate · 95% CI'),
+        h('span', {}, 'Passed'), h('span', { class: 'num' }, 'Cost')),
+      data.groups.map(g => branchGroup(g, d.id, pick))));
 }
 
-function branchGroup(g, parentId, pick) {
+function cibar(g) {
   const bar = h('span', { class: 'cibar', role: 'img',
     'aria-label': g.done ? `pass rate ${fmt.pct(g.rate)}, 95% CI ${fmt.pct(g.lo)} to ${fmt.pct(g.hi)}` : 'no finished branches' });
   const ci = h('span', { class: 'ci' });
   ci.style.left = `${g.lo * 100}%`;
-  ci.style.width = `${(g.hi - g.lo) * 100}%`;
+  ci.style.width = `${Math.max((g.hi - g.lo) * 100, 1)}%`;
   bar.append(ci);
   if (g.done) {
     const mark = h('span', { class: 'rate' });
     mark.style.left = `${g.rate * 100}%`;
     bar.append(mark);
   }
-  const parts = [`${g.passes}/${g.done} passed`];
-  if (g.done) parts.push(fmt.pct(g.rate), `CI ${fmt.pct(g.lo)}–${fmt.pct(g.hi)}`);
-  if (g.errors) parts.push(`${g.errors} error${g.errors === 1 ? '' : 's'}`);
-  if (g.running) parts.push(`${g.running} running`);
+  return bar;
+}
+
+function branchGroup(g, parentId, pick) {
   // Eval variants replace the whole system prompt, so their labels start alike: name the variant.
   const variants = new Set(g.runs.map(r => (r.eval && r.eval.variant) || ''));
   const variant = variants.size === 1 ? [...variants][0] : '';
+  const cost = g.runs.reduce((s, r) => s + (r.cost_usd || 0), 0);
+  const stats = h('span', { class: 'bstats' }, h('b', {}, `${g.passes}/${g.done}`),
+    g.done ? ` · ${fmt.pct(g.rate)} · ${fmt.pct(g.lo)}–${fmt.pct(g.hi)}` : '',
+    g.errors ? ` · ${g.errors} err` : '', g.running ? ` · ${g.running} running` : '');
   return h('details', { class: 'bgroup' },
-    h('summary', {}, h('span', { class: 'bstep' }, `step ${g.step}`),
-      h('code', { class: 'blabel', title: JSON.stringify(g.change) }, variant ? `eval ${variant}: ${g.label}` : g.label), bar,
-      h('span', { class: 'bstats' }, parts.join(' · '))),
-    h('ul', { class: 'branch-runs' }, g.runs.map(r => {
+    h('summary', { class: 'brow' },
+      h('span', { class: 'mono' }, `step ${g.step}`),
+      h('span', { class: 'blabel', title: JSON.stringify(g.change) }, variant ? `eval ${variant}: ${g.label}` : g.label),
+      cibar(g), stats, h('span', { class: 'num' }, cost ? `$${cost.toFixed(2)}` : '–')),
+    h('ul', { class: 'bruns' }, g.runs.map(r => {
       const box = h('input', { type: 'checkbox', 'aria-label': `Select ${r.id} to compare` });
       box.addEventListener('change', () => pick(box, r.id));
       return h('li', {}, box,
         h('a', { href: `#/run/${enc(r.id)}`, class: 'mono', title: r.id }, short(r.id)),
-        h('span', {}, resultBadge(r)),
+        status(r),
         h('span', { class: 'num muted' }, fmt.dur(r.duration_ms)),
         h('span', { class: 'num muted' }, fmt.cost(r.cost_usd)),
         h('a', { class: 'small', href: `#/compare/${enc(parentId)}/${enc(r.id)}` }, 'vs parent'),
@@ -555,21 +804,43 @@ function branchGroup(g, parentId, pick) {
     })));
 }
 
+// ---------- task ----------
+
+const shellQuote = s => (/^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`);
+
+function taskView(task) {
+  if (!task || typeof task !== 'object' || Array.isArray(task)) return h('pre', { class: 'code' }, JSON.stringify(task, null, 2));
+  const order = ['id', 'model', 'effort', 'prompt', 'system', 'template', 'workdir', 'setup', 'check', 'max_steps', 'tool_timeout'];
+  const keys = [...order.filter(k => k in task), ...Object.keys(task).filter(k => !order.includes(k))];
+  const isCmd = c => Array.isArray(c) && c.length > 0 && c.every(s => typeof s === 'string');
+  const value = v => {
+    if (typeof v === 'string') return v.length > 80 || v.includes('\n') ? h('div', { class: 'text' }, v) : h('span', {}, v);
+    if (typeof v === 'number' || typeof v === 'boolean') return h('span', { class: 'mono' }, String(v));
+    if (isCmd(v)) return h('pre', { class: 'code' }, `$ ${v.map(shellQuote).join(' ')}`);
+    if (Array.isArray(v) && v.every(isCmd)) return h('pre', { class: 'code' }, v.map(c => `$ ${c.map(shellQuote).join(' ')}`).join('\n'));
+    return h('pre', { class: 'code' }, JSON.stringify(v, null, 2));
+  };
+  return h('div', { class: 'table-wrap task' },
+    h('dl', { class: 'kv' }, keys.flatMap(k => [h('dt', {}, k), h('dd', {}, value(task[k]))])),
+    fold('As JSON', h('pre', { class: 'code' }, JSON.stringify(task, null, 2))));
+}
+
 // ---------- compare ----------
 
 async function viewCompare(my, a, b) {
   document.title = 'Compare · Furcate';
-  render(my, h('p', { class: 'muted' }, 'Loading comparison…'));
+  shownRun = null;
+  render(my, page(h('p', { class: 'muted' }, 'Loading comparison…')));
   const d = await api(`/api/compare?a=${enc(a)}&b=${enc(b)}`);
   if (!live(my)) return;
   const A = d.a, B = d.b, f = d.files;
   const origin = r => (r.parent_run_id
     ? h('span', {}, 'branch of ', h('a', { href: `#/run/${enc(r.parent_run_id)}`, class: 'mono' }, short(r.parent_run_id)),
-      ` at step ${r.parent_step}: `, h('code', {}, r.change_label || 'none'))
+      ` at step ${r.parent_step}: `, h('code', {}, r.change_label || 'no change'))
     : 'original');
   const rows = [
     ['Origin', origin(A), origin(B), false],
-    ['Result', resultBadge(A), resultBadge(B), (A.outcome || A.status) !== (B.outcome || B.status)],
+    ['Result', status(A), status(B), (A.outcome || A.status) !== (B.outcome || B.status)],
   ];
   const val = (label, get, show = fmt.num) => rows.push([label, show(get(A)), show(get(B)), get(A) !== get(B)]);
   val('LLM calls', r => r.usage.llm_calls);
@@ -587,35 +858,35 @@ async function viewCompare(my, a, b) {
     ...f.only_b.map(p => h('li', { class: 'only-b' }, h('span', { class: 'mk', title: 'only in B' }, '+'), p, h('span', { class: 'muted' }, '  only in B'))),
   ];
   const runHead = (tag, r) => h('th', { scope: 'col' }, `${tag} `, h('a', { href: `#/run/${enc(r.id)}`, class: 'mono', title: r.id }, short(r.id)));
-  render(my,
-    h('section', { class: 'panel' },
-      h('div', { class: 'toolbar' }, h('h1', {}, 'Compare runs'), h('span', { class: 'spacer' }),
-        h('a', { href: `#/compare/${enc(b)}/${enc(a)}` }, 'Swap A and B')),
-      h('div', { class: 'table-wrap' }, h('table', { class: 'cmp' },
-        h('thead', {}, h('tr', {}, h('th', {}), runHead('A', A), runHead('B', B))),
-        h('tbody', {}, rows.map(([k, va, vb, differs]) => h('tr', {}, h('th', { scope: 'row' }, k),
-          h('td', { class: differs ? 'differs' : null }, va), h('td', { class: differs ? 'differs' : null }, vb))))))),
-    h('section', { class: 'panel' },
-      h('div', { class: 'panel-head' }, h('h2', {}, 'Files at the end of the run'), f.available
+  render(my, page(
+    h('div', { class: 'crumbs' }, h('a', { href: '#/runs' }, 'Runs'), ' / compare'),
+    h('div', { class: 'page-head' }, h('h1', {}, 'Compare runs'), h('span', { class: 'spacer' }),
+      h('a', { class: 'btn sm', href: `#/compare/${enc(b)}/${enc(a)}` }, 'Swap A and B')),
+    h('div', { class: 'table-wrap' }, h('table', { class: 'grid cmp' },
+      h('thead', {}, h('tr', {}, h('th', {}), runHead('A', A), runHead('B', B))),
+      h('tbody', {}, rows.map(([k, va, vb, differs]) => h('tr', { class: differs ? null : 'same' },
+        h('th', { scope: 'row', class: 'muted' }, k), h('td', {}, va), h('td', {}, vb)))))),
+    h('div', { class: 'sec' },
+      h('div', { class: 'sec-title' }, 'Files at the end of the run', f.available
         ? h('span', { class: 'muted' }, `${f.a} in A, ${f.b} in B · ${f.changed.length} differ · ${f.only_a.length} only in A · ${f.only_b.length} only in B · ${f.same} identical`)
         : null),
-      !f.available ? h('p', { class: 'empty' }, 'One of the runs has no final file manifest (it errored or predates manifests).')
+      h('div', { class: 'table-wrap' }, !f.available ? h('p', { class: 'empty' }, 'One of the runs has no final file manifest (it errored or predates manifests).')
         : fileItems.length ? h('ul', { class: 'files' }, fileItems)
-          : h('p', { class: 'empty' }, 'Both runs ended with identical files.')));
-}
-
-// snapshotNotice says what a snapshot is and where to start.
-function snapshotNotice(i) {
-  return h('div', { class: 'notice', role: 'note' },
-    i.note ? h('span', {}, `${i.note} `) : null,
-    'Every trace, prompt and tool call is browsable; forking needs ',
-    i.home ? h('a', { href: i.home }, 'Furcate') : 'Furcate', ' running with a sandbox driver.',
-    i.featured ? h('span', {}, ' Start with ', h('a', { href: `#/run/${enc(i.featured)}` }, 'a failed run and its forks'), '.') : null);
+          : h('p', { class: 'empty' }, 'Both runs ended with identical files.')))));
 }
 
 // ---------- start ----------
 
+// snapshotNotice says what a snapshot is and where to start.
+function snapshotNotice(i) {
+  return h('div', { class: 'notice', role: 'note' },
+    h('span', {}, h('strong', {}, 'Snapshot'), ` · ${i.note || 'Recorded runs, read-only.'}`),
+    h('span', { class: 'muted' }, 'Forking needs ', i.home ? h('a', { href: i.home }, 'Furcate') : 'Furcate', ' running locally.'),
+    i.featured ? h('a', { href: `#/run/${enc(i.featured)}` }, 'Start with a failed run and its branches →') : null);
+}
+
 window.addEventListener('hashchange', route);
+window.addEventListener('resize', fitSplit);
 api('/api/info')
   .then(i => {
     info = i;
@@ -624,7 +895,7 @@ api('/api/info')
     chip.title = i.fork_enabled ? 'Forks run on this server’s sandbox driver'
       : i.static ? 'Recorded runs as static files: browsing only, no forks' : 'Started without -driver: browsing only, no forks';
     chip.hidden = false;
-    if (i.static) app.before(snapshotNotice(i));
+    if (i.static) document.querySelector('header.top').after(snapshotNotice(i));
   })
   .catch(() => {})
   .finally(route);

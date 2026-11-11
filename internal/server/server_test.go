@@ -233,10 +233,12 @@ func TestStaticFilesEmbeddedAndServed(t *testing.T) {
 			t.Fatalf("index.html doesn't load app.js:\n%s", b)
 		}
 	}
-	// The UI makes no requests off this origin.
+	// The UI makes no requests off this origin. (The favicon's SVG names its
+	// namespace, which is an identifier, not a request.)
 	for _, name := range []string{"static/index.html", "static/app.js", "static/style.css"} {
 		b, _ := fs.ReadFile(staticFiles, name)
-		if strings.Contains(string(b), "http://") || strings.Contains(string(b), "https://") {
+		s := strings.ReplaceAll(string(b), "http://www.w3.org/2000/svg", "")
+		if strings.Contains(s, "http://") || strings.Contains(s, "https://") {
 			t.Fatalf("%s references an absolute URL", name)
 		}
 	}
